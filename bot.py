@@ -123,7 +123,6 @@ async def user_start_mock(callback: CallbackQuery, state: FSMContext):
 
     await callback.message.answer(f"🚀 **آزمون ماک: {mock_row[0]}**\n\n🎧 **سگمنت شماره ۱:**\nبه فایل صوتی زیر گوش دهید و ترجمه/پاسخ آن را به صورت ویس ارسال کنید:")
     
-    # ارسال فایل صوتی (پشتیبانی از انواع فایل‌های صوتی و وویس)
     try:
         await callback.message.answer_voice(voice=file_id)
     except:
@@ -196,10 +195,9 @@ async def process_mock_title(message: Message, state: FSMContext):
     conn.close()
 
     await state.update_data(mock_id=mock_id, mock_title=mock_title, segment_index=1)
-    await message.answer(f"✅ ماک **«{mock_title}»** ایجاد شد.\n\n🎙 لطفاً **فایل صوتی سگمنت شماره ۱** را ارسال یا آپلود کنید (پشتیبانی از ویس، فایل صوتی یا سند):")
+    await message.answer(f"✅ ماک **«{mock_title}»** ایجاد شد.\n\n🎙 لطفاً **فایل صوتی سگمنت شماره ۱** را ارسال یا آپلود کنید:")
     await state.set_state(AdminStates.waiting_for_segment_audio)
 
-# دریافت فایل صوتی یا وویس از ادمین (رفع مشکل عدم واکنش)
 @dp.message(AdminStates.waiting_for_segment_audio, F.voice | F.audio | F.document)
 async def process_segment_audio(message: Message, state: FSMContext):
     file_id = None
@@ -235,7 +233,6 @@ async def process_segment_key(message: Message, state: FSMContext):
     conn.commit()
     conn.close()
 
-    # دو گزینه درخواستی: سگمنت بعدی یا پایان بارگذاری
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ برو به سگمنت بعدی", callback_data="admin_add_more_segment")],
         [InlineKeyboardButton(text="🏁 پایان بارگذاری", callback_data="admin_finish_mock")]
@@ -341,7 +338,7 @@ async def admin_clear_db(callback: CallbackQuery):
     await callback.message.answer("🗑 تمام اطلاعات پاک شد.")
     await callback.answer()
 
-# --- تحلیل ویس کاربر در آزمون ---
+# --- تحلیل ویس کاربر در آزمون با مدل جدید gemini-3.8-flash ---
 @dp.message(UserTestStates.taking_test, F.voice)
 async def handle_user_voice_test(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -382,8 +379,10 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
         await bot.download_file(file.file_path, file_path)
         
         audio_file = ai_client.files.upload(file=file_path)
+        
+        # آپدیت نام مدل به gemini-3.8-flash طبق درخواست API
         response = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.8-flash",
             contents=[system_prompt, audio_file]
         )
         
