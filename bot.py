@@ -1,17 +1,51 @@
 import os
 import asyncio
+import logging
+import sqlite3
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from google import genai
+from aiohttp import web
 
-# توکن تلگرام ارسال شده توسط شما
+# تنظیم لاگ‌ها
+logging.basicConfig(level=logging.INFO)
+
 TELEGRAM_BOT_TOKEN = "8834529401:AAFEVB8Xyzob8PVkN-V2Qn0MfZ41NscWkAw"
-
-# دریافت کلید Gemini از متغیرهای محیطی سرور
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+ADMIN_PASSWORD = "2377451"
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
+
+# --- تنظیمات دیتابیس SQLite برای ذخیره نتایج و وضعیت ادمین‌ها ---
+def init_db():
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            analysis TEXT,
+            date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# FSM برای ورود به پنل ادمین
+class AdminStates(StatesGroup):
+    waiting_for_password = State()
 
 SYSTEM_PROMPT = """
 تو یک استاد و ارزیابی‌کننده حرفه‌ای زبان انگلیسی هستی.
@@ -31,9 +65,77 @@ SYSTEM_PROMPT = """
 async def cmd_start(message: Message):
     await message.answer(
         "سلام! 👋 به ربات تعیین سطح انگلیسی خوش آمدید.\n\n"
-        "لطفاً یک ویس (Voice) به زبان انگلیسی بفرستید تا آن را از نظر تلفظ، گرامر، مکث‌ها و سطح CEFR تحلیل کنم."
+        "لطفاً یک ویس (Voice) به زبان انگلیسی بفرستید تا آن را از نظر تلفظ، گرامر، مکث‌ها و سطح CEFR تحلیل کنم.\n\n"
+        "🔑 برای ورود به پنل مدیریت دستور /admin را وارد کنید."
     )
 
+# --- دستورات پنل ادمین ---
+@dp.message(F.text == "/admin")
+async def cmd_admin(message: Message, state: FSMContext):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM admins WHERE user_id = ?", (message.from_user.id,))
+    is_admin = cursor.fetchone()
+    conn.close()
+
+    if is_admin:
+        await show_admin_panel(message)
+    else:
+        await message.answer("🔒 لطفاً رمز عبور پنل ادمین را وارد کنید:")
+        await state.set_state(AdminStates.waiting_for_password)
+
+@dp.message(AdminStates.waiting_for_password)
+async def process_admin_password(message: Message, state: FSMContext):
+    if message.text == ADMIN_PASSWORD:
+        conn = sqlite3.connect("bot_database.db")
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (message.from_user.id,))
+        conn.commit()
+        conn.close()
+        
+        await state.clear()
+        await message.answer("✅ ورود با موفقیت انجام شد!")
+        await show_admin_panel(message)
+    else:
+        await message.answer("❌ رمز عبور اشتباه است. دوباره تلاش کنید یا با /start خارج شوید.")
+
+async def show_admin_panel(message: Message):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 مشاهده آخرین نتایج کاربران", callback_data="admin_view_results")],
+        [InlineKeyboardButton(text="🗑 پاکسازی تاریخچه", callback_data="admin_clear_db")]
+    ])
+    await message.answer("⚙️ **خوش آمدید به پنل مدیریت ربات**\n\nلطفاً یکی از گزینه‌های زیر را انتخاب کنید:", reply_markup=keyboard)
+
+@dp.callback_query(F.data == "admin_view_results")
+async def admin_view_results(callback: CallbackQuery):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT username, analysis, date FROM results ORDER BY id DESC LIMIT 5")
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        await callback.message.edit_text("📭 هیچ نتیجه‌ای تاکنون ثبت نشده است.")
+        return
+
+    text = "📊 **۵ تحلیل اخیر کاربران:**\n\n"
+    for row in rows:
+        uname = row[0] or "بدون نام"
+        text += f"👤 کاربر: {uname}\n🕒 زمان: {row[2]}\n{row[1][:200]}...\n-------------------\n"
+    
+    await callback.message.edit_text(text)
+
+@dp.callback_query(F.data == "admin_clear_db")
+async def admin_clear_db(callback: CallbackQuery):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM results")
+    conn.commit()
+    conn.close()
+    await callback.message.answer("🗑 تمام تاریخچه نتایج پاک شد.")
+    await callback.answer()
+
+# --- تحلیل ویس کاربر و ذخیره در دیتابیس ---
 @dp.message(F.voice)
 async def handle_voice(message: Message):
     status_msg = await message.answer("📥 در حال دریافت و تحلیل فایل صوتی شما...")
@@ -56,8 +158,19 @@ async def handle_voice(message: Message):
             contents=[SYSTEM_PROMPT, audio_file]
         )
         
-        await status_msg.edit_text(response.text)
+        analysis_result = response.text
+        await status_msg.edit_text(analysis_result)
         ai_client.files.delete(name=audio_file.name)
+
+        # ذخیره نتیجه در دیتابیس
+        conn = sqlite3.connect("bot_database.db")
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO results (user_id, username, analysis) VALUES (?, ?, ?)",
+            (message.from_user.id, message.from_user.username, analysis_result)
+        )
+        conn.commit()
+        conn.close()
 
     except Exception as e:
         await status_msg.edit_text(f"❌ خطایی در تحلیل رخ داد:\n{str(e)}")
@@ -66,8 +179,22 @@ async def handle_voice(message: Message):
         if os.path.exists(file_path):
             os.remove(file_path)
 
+# وب‌سرویس برای زنده نگه داشتن روی Render
+async def handle_health_check(request):
+    return web.Response(text="Bot and Admin Panel are running alive!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
 async def main():
-    print("ربات روی سرور فعال شد...")
+    await start_web_server()
+    logging.info("Starting bot polling with Admin Panel...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
