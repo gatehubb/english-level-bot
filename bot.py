@@ -10,7 +10,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from google import genai
 from aiohttp import web
 
-# تنظیم لاگ‌ها
 logging.basicConfig(level=logging.INFO)
 
 TELEGRAM_BOT_TOKEN = "8834529401:AAFEVB8Xyzob8PVkN-V2Qn0MfZ41NscWkAw"
@@ -20,53 +19,18 @@ ADMIN_PASSWORD = "2377451"
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# --- دیتابیس سه‌بعدی برای ماک‌ها و سگمنت‌ها ---
 def init_db():
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
-    
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id INTEGER PRIMARY KEY
-        )
-    """)
-    
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS mocks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT UNIQUE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS segments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            mock_id INTEGER,
-            file_id TEXT,
-            answer_key TEXT,
-            segment_index INTEGER,
-            FOREIGN KEY(mock_id) REFERENCES mocks(id) ON DELETE CASCADE
-        )
-    """)
-    
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            username TEXT,
-            mock_title TEXT,
-            analysis TEXT,
-            date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
+    cursor.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)")
+    cursor.execute("CREATE TABLE IF NOT EXISTS mocks (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT UNIQUE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    cursor.execute("CREATE TABLE IF NOT EXISTS segments (id INTEGER PRIMARY KEY AUTOINCREMENT, mock_id INTEGER, file_id TEXT, answer_key TEXT, segment_index INTEGER, FOREIGN KEY(mock_id) REFERENCES mocks(id) ON DELETE CASCADE)")
+    cursor.execute("CREATE TABLE IF NOT EXISTS results (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, mock_title TEXT, analysis TEXT, date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     conn.commit()
     conn.close()
 
 init_db()
 
-# --- حالت‌های FSM ---
 class AdminStates(StatesGroup):
     waiting_for_password = State()
     waiting_for_mock_title = State()
@@ -77,7 +41,6 @@ class AdminStates(StatesGroup):
 class UserTestStates(StatesGroup):
     taking_test = State()
 
-# --- دستورات شروع و انتخاب آزمون برای کاربر ---
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
@@ -133,7 +96,6 @@ async def user_start_mock(callback: CallbackQuery, state: FSMContext):
             
     await callback.answer()
 
-# --- پنل ادمین ---
 @dp.message(F.text == "/admin")
 async def cmd_admin(message: Message, state: FSMContext):
     conn = sqlite3.connect("bot_database.db")
@@ -172,7 +134,6 @@ async def show_admin_panel(message: Message):
     ])
     await message.answer("⚙️ **پنل مدیریت پیشرفته ماک‌ها**\n\nلطفاً یکی از گزینه‌های زیر را انتخاب کنید:", reply_markup=keyboard)
 
-# --- ساخت ماک و افزودن سگمنت‌ها ---
 @dp.callback_query(F.data == "admin_create_mock")
 async def admin_create_mock(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer("📝 لطفاً **عنوان (نام) ماک جدید** را ارسال کنید:")
@@ -255,7 +216,6 @@ async def admin_finish_mock(callback: CallbackQuery, state: FSMContext):
     await show_admin_panel(callback.message)
     await callback.answer()
 
-# --- تغییر نام ماک‌ها (Rename) ---
 @dp.callback_query(F.data == "admin_list_mocks")
 async def admin_list_mocks(callback: CallbackQuery):
     conn = sqlite3.connect("bot_database.db")
@@ -306,7 +266,6 @@ async def admin_back_home(callback: CallbackQuery):
     await show_admin_panel(callback.message)
     await callback.answer()
 
-# --- مشاهده نتایج و پاکسازی ---
 @dp.callback_query(F.data == "admin_view_results")
 async def admin_view_results(callback: CallbackQuery):
     conn = sqlite3.connect("bot_database.db")
@@ -338,7 +297,6 @@ async def admin_clear_db(callback: CallbackQuery):
     await callback.message.answer("🗑 تمام اطلاعات پاک شد.")
     await callback.answer()
 
-# --- تحلیل ویس کاربر در آزمون با مدل جدید gemini-3.8-flash ---
 @dp.message(UserTestStates.taking_test, F.voice)
 async def handle_user_voice_test(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -380,12 +338,20 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
         
         audio_file = ai_client.files.upload(file=file_path)
         
-        # آپدیت نام مدل به gemini-3.8-flash طبق درخواست API
-        response = ai_client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=[system_prompt, audio_file]
-        )
-        
+        # افزودن سیستم تلاش مجدد (Retry) در صورت خطای موقت سرور 503
+        response = None
+        for attempt in range(3):
+            try:
+                response = ai_client.models.generate_content(
+                    model="gemini-3.8-flash",
+                    contents=[system_prompt, audio_file]
+                )
+                break
+            except Exception as api_err:
+                if attempt == 2:
+                    raise api_err
+                await asyncio.sleep(3)
+
         analysis_result = response.text
         await status_msg.edit_text(analysis_result)
         ai_client.files.delete(name=audio_file.name)
@@ -424,7 +390,6 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
         if os.path.exists(file_path):
             os.remove(file_path)
 
-# --- وب‌سرور ---
 async def handle_health_check(request):
     return web.Response(text="Bot is running alive!")
 
