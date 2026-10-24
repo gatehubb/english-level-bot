@@ -209,10 +209,11 @@ async def admin_add_more_segment(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_segment_audio)
     await callback.answer()
 
+# اصلاح و بازگشت عملکرد دکمه پایان بارگذاری
 @dp.callback_query(F.data == "admin_finish_mock")
 async def admin_finish_mock(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await message.answer("🎉 بارگذاری ماک با موفقیت به اتمام رسید!")
+    await callback.message.edit_text("🎉 بارگذاری ماک با موفقیت به اتمام رسید!")
     await show_admin_panel(callback.message)
     await callback.answer()
 
@@ -380,13 +381,11 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
         analysis_result = response.text.strip()
         ai_client.files.delete(name=audio_file.name)
 
-        # بررسی اینکه آیا صوت نامعتبر بوده است یا خیر
         if analysis_result.startswith("INVALID_AUDIO:"):
             error_details = analysis_result.replace("INVALID_AUDIO:", "").strip()
             await status_msg.edit_text(f"⚠️ **اخطار در بررسی فایل صوتی:**\n\n{error_details}\n\nلطفاً دوباره ویس خود را با دقت و به‌صورت کامل ارسال کنید تا ارزیابی انجام شود.")
             return
 
-        # اگر صوت معتبر بود، نتیجه را نمایش داده و در دیتابیس ثبت می‌کنیم و به سگمنت بعدی می‌رویم
         await status_msg.edit_text(analysis_result)
 
         conn = sqlite3.connect("bot_database.db")
