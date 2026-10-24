@@ -209,7 +209,6 @@ async def admin_add_more_segment(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_segment_audio)
     await callback.answer()
 
-# اصلاح و بازگشت عملکرد دکمه پایان بارگذاری
 @dp.callback_query(F.data == "admin_finish_mock")
 async def admin_finish_mock(callback: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -307,7 +306,7 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
     seg_id = data.get("seg_id")
     answer_key = data.get("answer_key")
 
-    status_msg = await message.answer("📥 در حال دریافت و بررسی صوت شما...")
+    status_msg = await message.answer("📥 در حال بررسی و تحلیل صوت شما...")
     file_path = f"voice_{message.from_user.id}.ogg"
 
     try:
@@ -315,48 +314,48 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
             await status_msg.edit_text("❌ کلید GEMINI_API_KEY تنظیم نشده است.")
             return
 
+        # پرامپت اصلاح‌شده برای خروجی بسیار کوتاه، جدول‌بندی‌شده، بدون واژه‌نامه و با ایموجی
         system_prompt = f"""
 تو یک سیستم ارزیابی حرفه‌ای آزمون ترجمه شفاهی NAATI CCL هستی.
 
 ⚠️ **مرحله اول (اعتبارسنجی صوت):**
-ابتدا بررسی کن که آیا فایل صوتی ارسالی کاربر معتبر است یا خیر. اگر صوت خالی، بی‌صدا، دارای نویز شدید مطلق، بسیار ناقص (قطع ناگهانی در ابتدای جمله)، یا فاقد هرگونه تلاش برای صحبت یا ترجمه بود، پاسخ خود را دقیقا با عبارت زیر شروع کن:
-`INVALID_AUDIO: [دلیل توضیح مختصر به فارسی که چرا صوت قابل تحلیل نیست، مثلاً خالی بودن یا قطع ناگهانی]`
+اگر صوت خالی، بی‌صدا، دارای نویز شدید مطلق یا بسیار ناقص بود، پاسخ خود را دقیقاً با این عبارت شروع کن:
+`INVALID_AUDIO: [دلیل مختصر به فارسی]`
 
-اگر صوت معتبر است، برچسب بالا را نیاور و ارزیابی خود را دقیقاً بر اساس معیارهای جزوه آموزشی NAATI (شامل Accuracy بررسی Addition/Omission/Distortion، Quality of Language بررسی Register، و Quality of Delivery بررسی Hesitations) برای سگمنت شماره {curr_index} از آزمون ماک "{mock_title}" با کلید مرجع زیر انجام بده:
+اگر صوت معتبر است، برچسب بالا را نیاور و ارزیابی خود را برای سگمنت شماره {curr_index} از آزمون ماک "{mock_title}" با کلید مرجع زیر انجام بده:
 
 🎯 **کلید مرجع (پاسخ صحیح):**
 "{answer_key}"
 
-خروجی تحلیل را با فرمت زیر ارسال کن:
+📌 **قوانین نگارش خروجی (بسیار مهم):**
+- متن باید بسیار **کوتاه، خلاصه و مفید** باشد (از توضیحات طولانی پرهیز کن).
+- حتماً از ایموجی‌های مناسب استفاده کن.
+- بخش Vocab List را به طور کامل حذف کن و اصلاً نیاور.
+- معیارهای ارزیابی را دقیقاً در قالب یک جدول Markdown شکیل بگذار.
 
-**Evaluation**
+خروجی را با این فرمت دقیق ارسال کن:
 
-**Original Segment:**
-[متن اصلی انگلیسی سگمنت]
+📋 **نتیجه ارزیابی سگمنت {curr_index}**
 
-**Your Translation:**
-[متن پیاده‌شده یا ترجمه گفتار کاربر]
+📌 **متن مرجع:** [متن اصلی انگلیسی سگمنت]
+🗣 **ترجمه شما:** [متن پیاده‌شده یا ترجمه گفتار کاربر]
 
-**Assessment Criteria**
+📊 **ارزیابی عملکرد (Assessment Criteria)**
 
-| Category | Areas to Improve |
+| معیار | نکات بهبود و تحلیل |
 | :--- | :--- |
-| **Accuracy** | • **Addition/Omission/Distortion:** (توضیحات خطاها بر اساس جزوه) |
-| **Quality Of Language** | • **Pronunciation/Register:** (ایرادات تلفظی یا سطح زبانی) |
-| **Quality Of Delivery** | • **Hesitations:** (بررسی مکث‌ها، um/uh و روانی کلام) |
+| 🎯 **دقت (Accuracy)** | [توضیح کوتاه خطاهای Addition/Omission/Distortion با ایموجی] |
+| 🗣 **کیفیت زبان (Language)** | [توضیح کوتاه تلفظ و Register با ایموجی] |
+| ⏱ **کیفیت ارائه (Delivery)** | [توضیح کوتاه مکث‌ها و تپق‌ها با ایموجی] |
 
-**Improved Version**
-[نسخه اصلاح‌شده و بهینه ترجمه]
+✨ **نسخه پیشنهادی بهبودیافته:**
+> [نسخه بهینه و اصلاح‌شده ترجمه]
 
-**Vocab List**
-• [کلمه کلیدی ۱] : [معادل]
-• [کلمه کلیدی ۲] : [معادل]
-
-**Performance Overview**
-• Accuracy: [عدد]%
-• Language: [عدد]%
-• Delivery: [عدد]%
-• **Overall:** [عدد]%
+📈 **نمرات شما:**
+• دقت (Accuracy): [عدد]%
+• زبان (Language): [عدد]%
+• ارائه (Delivery): [عدد]%
+• **نمره کل (Overall):** **[عدد]%**
 """
 
         ai_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -383,7 +382,7 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
 
         if analysis_result.startswith("INVALID_AUDIO:"):
             error_details = analysis_result.replace("INVALID_AUDIO:", "").strip()
-            await status_msg.edit_text(f"⚠️ **اخطار در بررسی فایل صوتی:**\n\n{error_details}\n\nلطفاً دوباره ویس خود را با دقت و به‌صورت کامل ارسال کنید تا ارزیابی انجام شود.")
+            await status_msg.edit_text(f"⚠️ **اخطار در بررسی فایل صوتی:**\n\n{error_details}\n\nلطفاً دوباره ویس خود را با دقت ارسال کنید.")
             return
 
         await status_msg.edit_text(analysis_result)
@@ -436,7 +435,7 @@ async def start_web_server():
 
 async def main():
     await start_web_server()
-    logging.info("Starting Multi-Mock bot polling with Audio Validation...")
+    logging.info("Starting Multi-Mock bot polling with concise table format...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
