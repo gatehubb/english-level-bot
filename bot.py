@@ -70,29 +70,35 @@ async def user_start_mock(callback: CallbackQuery, state: FSMContext):
     cursor.execute("SELECT title FROM mocks WHERE id = ?", (mock_id,))
     mock_row = cursor.fetchone()
     
-    cursor.execute("SELECT id, file_id, answer_key FROM segments WHERE mock_id = ? ORDER BY segment_index ASC LIMIT 1", (mock_id,))
-    segment = cursor.fetchone()
+    cursor.execute("SELECT id, file_id, answer_key FROM segments WHERE mock_id = ? ORDER BY segment_index ASC", (mock_id,))
+    segments = cursor.fetchall()
     conn.close()
 
-    if not segment:
+    if not segments:
         await callback.message.answer("⚠️ این آزمون هنوز سگمنتی ندارد.")
         await callback.answer()
         return
 
-    seg_id, file_id, answer_key = segment
-    
+    # ذخیره لیست کل سگمنت‌ها در FSM برای مدیریت آزمون پیوسته
     await state.set_state(UserTestStates.taking_test)
-    await state.update_data(mock_id=mock_id, mock_title=mock_row[0], current_seg_index=1, seg_id=seg_id, answer_key=answer_key)
+    await state.update_data(
+        mock_id=mock_id,
+        mock_title=mock_row[0],
+        segments=segments,
+        current_index=0,
+        session_results=[]
+    )
 
-    await callback.message.answer(f"🚀 **آزمون ماک: {mock_row[0]}**\n\n🎧 **سگمنت شماره ۱:**\nبه فایل صوتی زیر گوش دهید و ترجمه/پاسخ آن را به صورت ویس ارسال کنید:")
+    first_seg = segments[0]
+    await callback.message.answer(f"🚀 **آغاز آزمون ماک: {mock_row[0]}**\n\n🎧 **سگمنت شماره ۱ از {len(segments)}:**\nبه فایل صوتی زیر گوش دهید و ترجمه آن را به صورت ویس ارسال کنید:")
     
     try:
-        await callback.message.answer_voice(voice=file_id)
+        await callback.message.answer_voice(voice=first_seg[1])
     except:
         try:
-            await callback.message.answer_audio(audio=file_id)
+            await callback.message.answer_audio(audio=first_seg[1])
         except:
-            await callback.message.answer_document(document=file_id)
+            await callback.message.answer_document(document=first_seg[1])
             
     await callback.answer()
 
@@ -300,13 +306,13 @@ async def admin_clear_db(callback: CallbackQuery):
 @dp.message(UserTestStates.taking_test, F.voice)
 async def handle_user_voice_test(message: Message, state: FSMContext):
     data = await state.get_data()
-    mock_id = data.get("mock_id")
     mock_title = data.get("mock_title")
-    curr_index = data.get("current_seg_index")
-    seg_id = data.get("seg_id")
-    answer_key = data.get("answer_key")
+    segments = data.get("segments")
+    curr_idx = data.get("current_index")
+    session_results = data.get("session_results")
 
-    status_msg = await message.answer("📥 در حال بررسی و تحلیل صوت شما...")
+    seg_id, file_id, answer_key = segments[curr_idx]
+    status_msg = await message.answer(f"📥 در حال پردازش سگمنت {curr_idx + 1}...")
     file_path = f"voice_{message.from_user.id}.ogg"
 
     try:
@@ -314,50 +320,46 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
             await status_msg.edit_text("❌ کلید GEMINI_API_KEY تنظیم نشده است.")
             return
 
-        # پرامپت اختصاصی با ساختار دقیق نمونه ارسالی شما و ایموجی‌های شکیل
         system_prompt = f"""
 تو یک سیستم ارزیابی حرفه‌ای آزمون ترجمه شفاهی NAATI CCL هستی.
 
-⚠️ **مرحله اول (اعتبارسنجی صوت):**
-اگر صوت خالی، بی‌صدا، دارای نویز شدید مطلق یا بسیار ناقص بود، پاسخ خود را دقیقاً با این عبارت شروع کن:
+اگر صوت خالی، بی‌صدا، دارای نویز شدید یا بسیار ناقص بود، پاسخ خود را دقیقاً با این عبارت شروع کن:
 `INVALID_AUDIO: [دلیل مختصر به فارسی]`
 
-اگر صوت معتبر است، ارزیابی خود را برای سگمنت شماره {curr_index} از آزمون ماک "{mock_title}" با کلید مرجع زیر انجام بده:
+اگر صوت معتبر است، ارزیابی خود را برای سگمنت شماره {curr_idx + 1} از آزمون ماک "{mock_title}" با کلید مرجع زیر انجام بده:
 
-🎯 **کلید مرجع (پاسخ صحیح):**
+🎯 **کلید مرجع:**
 "{answer_key}"
 
-📌 **قوانین ساختار خروجی (دقیقاً طبق نمونه زیر و بدون هیچ جدول یا علامت | ):**
+خروجی را دقیقاً با این فرمت و بدون استفاده از ستاره دور سرتیترها ارسال کن:
 
-📊 **نتیجه ارزیابی**
+نتیجه ارزیابی سگمنت {curr_idx + 1}
 
-📌 **متن مرجع:**
-[متن اصلی انگلیسی سگمنت]
+متن مرجع:
+{answer_key}
 
-🗣 **ترجمه شما:**
-[متن پیاده‌شده یا ترجمه گفتار کاربر]
+ترجمه شما:
+[متن پیاده‌شده از گفتار کاربر]
 
-🔍 **ارزیابی عملکرد (Assessment Criteria)**
+ارزیابی عملکرد (Assessment Criteria)
 
-🎯 **دقت (Accuracy):**
-[توضیح مختصر خطاهای Addition/Omission/Distortion]
+دقت (Accuracy):
+[توضیح کوتاه]
 
-🗣 **کیفیت زبان (Language):**
-[توضیح مختصر تلفظ و Register]
+کیفیت زبان (Language):
+[توضیح کوتاه]
 
-⏱ **کیفیت ارائه (Delivery):**
-[توضیح مختصر مکث‌ها و روان بودن]
+کیفیت ارائه (Delivery):
+[توضیح کوتاه]
 
-💡 **نسخه درست و بهبود یافته:**
-[نسخه بهینه و کامل ترجمه]
+نسخه درست و بهبود یافته:
+[نسخه بهینه ترجمه]
 
-📊 **نمرات شما:**
-
-• دقت (Accuracy): [عدد]%
-• زبان (Language): [عدد]%
-• ارائه (Delivery): [عدد]%
-
-🏆 **نمره کل (Overall):** **[عدد]%**
+نمرات شما:
+- دقت (Accuracy): [عدد]%
+- زبان (Language): [عدد]%
+- ارائه (Delivery): [عدد]%
+- نمره کل (Overall): [عدد]%
 """
 
         ai_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -384,37 +386,72 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
 
         if analysis_result.startswith("INVALID_AUDIO:"):
             error_details = analysis_result.replace("INVALID_AUDIO:", "").strip()
-            await status_msg.edit_text(f"⚠️ **اخطار در بررسی فایل صوتی:**\n\n{error_details}\n\nلطفاً دوباره ویس خود را با دقت ارسال کنید.")
+            await status_msg.edit_text(f"⚠️ **اخطار در بررسی فایل صوتی (سگمنت {curr_idx + 1}):**\n\n{error_details}\n\nلطفاً همین سگمنت را دوباره با ویس ارسال کنید.")
             return
 
-        await status_msg.edit_text(analysis_result)
+        # حذف پیام وضعیت و ذخیره نتیجه این سگمنت
+        await status_msg.delete()
+        session_results.append(analysis_result)
 
-        conn = sqlite3.connect("bot_database.db")
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO results (user_id, username, mock_title, analysis) VALUES (?, ?, ?, ?)",
-            (message.from_user.id, message.from_user.username, mock_title, f"[سگمنت {curr_index}]\n{analysis_result}")
-        )
-        conn.commit()
-
-        cursor.execute("SELECT id, file_id, answer_key FROM segments WHERE mock_id = ? AND segment_index > ? ORDER BY segment_index ASC LIMIT 1", (mock_id, curr_index))
-        next_segment = cursor.fetchone()
-        conn.close()
-
-        if next_segment:
-            next_seg_id, next_file_id, next_key = next_segment
-            await state.update_data(current_seg_index=curr_index + 1, seg_id=next_seg_id, answer_key=next_key)
-            await message.answer(f"🎧 **سگمنت شماره {curr_index + 1}:**\nبه فایل صوتی زیر گوش دهید:")
+        # رفتن به سگمنت بعدی یا پایان آزمون
+        next_idx = curr_idx + 1
+        if next_idx < len(segments):
+            await state.update_data(current_index=next_idx, session_results=session_results)
+            next_seg = segments[next_idx]
+            await message.answer(f"✅ سگمنت {curr_idx + 1} ثبت شد.\n\n🎧 **سگمنت شماره {next_idx + 1} از طول آزمون:**\nبه فایل صوتی زیر گوش دهید:")
             try:
-                await message.answer_voice(voice=next_file_id)
+                await message.answer_voice(voice=next_seg[1])
             except:
                 try:
-                    await message.answer_audio(audio=next_file_id)
+                    await message.answer_audio(audio=next_seg[1])
                 except:
-                    await message.answer_document(document=next_file_id)
+                    await message.answer_document(document=next_seg[1])
         else:
-            await state.clear()
-            await message.answer("🎉 **تبریک! شما تمام سگمنت‌های این آزمون را به اتمام رساندید.**\n\nبرای آزمون‌های دیگر /start را بزنید.")
+            # پایان آزمون و محاسبه میانگین نمرات کل
+            import re
+            acc_list, lang_list, del_list, overall_list = [], [], [], []
+            
+            for res in session_results:
+                acc_match = re.search(r"دقت\s*\(Accuracy\):\s*(\d+)%", res)
+                lang_match = re.search(r"زبان\s*\(Language\):\s*(\d+)%", res)
+                del_match = re.search(r"ارائه\s*\(Delivery\):\s*(\d+)%", res)
+                ov_match = re.search(r"نمره کل\s*\(Overall\):\s*(\d+)%", res)
+                
+                if acc_match: acc_list.append(int(acc_match.group(1)))
+                if lang_match: lang_list.append(int(lang_match.group(1)))
+                if del_match: del_list.append(int(del_match.group(1)))
+                if ov_match: overall_list.append(int(ov_match.group(1)))
+
+            avg_acc = sum(acc_list) // len(acc_list) if acc_list else 0
+            avg_lang = sum(lang_list) // len(lang_list) if lang_list else 0
+            avg_del = sum(del_list) // len(del_list) if del_list else 0
+            avg_overall = sum(overall_list) // len(overall_list) if overall_list else 0
+
+            # ذخیره کارنامه کلی در پایگاه داده
+            full_report_text = f"🎉 **کارنامه نهایی آزمون ماک: {mock_title}**\n\n" \
+                               f"📈 **میانگین نمرات کل آزمون:**\n" \
+                               f"• دقت (Accuracy): {avg_acc}%\n" \
+                               f"• زبان (Language): {avg_lang}%\n" \
+                               f"• ارائه (Delivery): {avg_del}%\n\n" \
+                               f"🏆 **نمره کل نهایی (Overall): {avg_overall}%**"
+
+            conn = sqlite3.connect("bot_database.db")
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO results (user_id, username, mock_title, analysis) VALUES (?, ?, ?, ?)",
+                (message.from_user.id, message.from_user.username, mock_title, full_report_text + "\n\n" + "\n---\n".join(session_results))
+            )
+            conn.commit()
+            conn.close()
+
+            # دکمه شیشه‌ای برای مشاهده جزئیات کل سگمنت‌ها
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📋 مشاهده تحلیل جزئیات هر سگمنت", callback_data="show_detailed_report")]
+            ])
+
+            await state.update_data(session_results=session_results) # نگهداری برای نمایش جزئیات
+            await message.answer(full_report_text, reply_markup=keyboard)
+            await state.set_state(UserTestStates.taking_test) # حفظ حالت برای دکمه
 
     except Exception as e:
         await status_msg.edit_text(f"❌ خطا در تحلیل:\n{str(e)}")
@@ -422,6 +459,23 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
     finally:
         if os.path.exists(file_path):
             os.remove(file_path)
+
+@dp.callback_query(F.data == "show_detailed_report")
+async def show_detailed_report(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    session_results = data.get("session_results", [])
+    
+    if not session_results:
+        await callback.message.answer("📭 اطلاعاتی برای نمایش موجود نیست.")
+        await callback.answer()
+        return
+
+    await callback.message.answer("📋 **گزارش کامل تحلیل تک‌تک سگمنت‌ها:**")
+    for res in session_results:
+        await callback.message.answer(res)
+    
+    await state.clear()
+    await callback.answer()
 
 async def handle_health_check(request):
     return web.Response(text="Bot is running alive!")
@@ -437,7 +491,7 @@ async def start_web_server():
 
 async def main():
     await start_web_server()
-    logging.info("Starting Multi-Mock bot polling with custom clean format...")
+    logging.info("Starting Multi-Mock continuous exam bot...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
