@@ -15,8 +15,8 @@ logging.basicConfig(level=logging.INFO)
 TELEGRAM_BOT_TOKEN = "8834529401:AAFEVB8Xyzob8PVkN-V2Qn0MfZ41NscWkAw"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 ADMIN_PASSWORD = "2377451"
-CHANNEL_USERNAME = "@YourChannelUsername"  # یوزرنیم کانال شما
-CHANNEL_LINK = "https://t.me/YourChannelUsername"  # لینک کانال شما
+CHANNEL_USERNAME = "@YourChannelUsername"
+CHANNEL_LINK = "https://t.me/YourChannelUsername"
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -26,7 +26,8 @@ def init_db():
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY, failed_attempts INTEGER DEFAULT 0, is_blocked INTEGER DEFAULT 0)")
     cursor.execute("CREATE TABLE IF NOT EXISTS tests (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT UNIQUE, test_type TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-    cursor.execute("CREATE TABLE IF NOT EXISTS segments (id INTEGER PRIMARY KEY AUTOINCREMENT, test_id INTEGER, file_id TEXT, answer_key TEXT, segment_index INTEGER, FOREIGN KEY(test_id) REFERENCES tests(id) ON DELETE CASCADE)")
+    # اضافه شدن فیلد segment_lang برای ذخیره زبان سگمنت (en یا fa)
+    cursor.execute("CREATE TABLE IF NOT EXISTS segments (id INTEGER PRIMARY KEY AUTOINCREMENT, test_id INTEGER, file_id TEXT, answer_key TEXT, segment_index INTEGER, segment_lang TEXT, FOREIGN KEY(test_id) REFERENCES tests(id) ON DELETE CASCADE)")
     cursor.execute("CREATE TABLE IF NOT EXISTS results (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, test_title TEXT, analysis TEXT, date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     conn.commit()
     conn.close()
@@ -36,6 +37,7 @@ init_db()
 class AdminStates(StatesGroup):
     waiting_for_password = State()
     waiting_for_test_title = State()
+    waiting_for_segment_lang = State()
     waiting_for_segment_audio = State()
     waiting_for_segment_key = State()
 
@@ -46,7 +48,6 @@ class UserTestStates(StatesGroup):
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     
-    # بررسی اینکه آیا کاربر ادمین بلاک شده است یا خیر
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     cursor.execute("SELECT is_blocked FROM admins WHERE user_id = ?", (message.from_user.id,))
@@ -84,7 +85,7 @@ async def user_start_test(callback: CallbackQuery, state: FSMContext):
     cursor.execute("SELECT title, test_type FROM tests WHERE id = ?", (test_id,))
     test_row = cursor.fetchone()
     
-    cursor.execute("SELECT id, file_id, answer_key FROM segments WHERE test_id = ? ORDER BY segment_index ASC", (test_id,))
+    cursor.execute("SELECT id, file_id, answer_key, segment_lang FROM segments WHERE test_id = ? ORDER BY segment_index ASC", (test_id,))
     segments = cursor.fetchall()
     conn.close()
 
@@ -106,9 +107,9 @@ async def user_start_test(callback: CallbackQuery, state: FSMContext):
     )
 
     first_seg = segments[0]
-    lang_label = "انگلیسی به فارسی 🇬🇧 ➡️ 🇮🇷" if test_type == "placement" and segments.index(first_seg) == 0 else ("فارسی به انگلیسی 🇮🇷 ➡️ 🇬🇧" if test_type == "placement" else f"سگمنت ۱ از {len(segments)}")
+    lang_dir = "انگلیسی به فارسی 🇬🇧 ➡️ 🇮🇷" if first_seg[3] == "en" else "فارسی به انگلیسی 🇮🇷 ➡️ 🇬🇧"
     
-    await callback.message.answer(f"آغاز آزمون: {test_title}\n\nبخش اول ({lang_label}):\nبه فایل صوتی زیر گوش دهید و ترجمه آن را به صورت ویس ارسال کنید:")
+    await callback.message.answer(f"آغاز آزمون: {test_title}\n\nسگمنت ۱ از {len(segments)} ({lang_dir}):\nبه فایل صوتی زیر گوش دهید و ترجمه آن را به صورت ویس ارسال کنید:")
     
     try:
         await callback.message.answer_voice(voice=first_seg[1])
@@ -177,7 +178,7 @@ async def process_admin_password(message: Message, state: FSMContext):
 
 async def show_admin_panel(message: Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="ساخت آزمون تعیین سطح (۲ سگمنت)", callback_data="admin_create_placement")],
+        [InlineKeyboardButton(text="ساخت آزمون تعیین سطح", callback_data="admin_create_placement")],
         [InlineKeyboardButton(text="ساخت آزمون ماک کامل", callback_data="admin_create_mock")],
         [InlineKeyboardButton(text="مشاهده نتایج کاربران", callback_data="admin_view_results")],
         [InlineKeyboardButton(text="پاکسازی کل اطلاعات", callback_data="admin_clear_db")]
@@ -202,12 +203,12 @@ async def admin_create_mock(callback: CallbackQuery, state: FSMContext):
 async def process_test_title(message: Message, state: FSMContext):
     title = message.text
     data = await state.get_data()
-    test_type = data.get("test_type")
+    seg_index = data.get("segment_index")
 
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO tests (title, test_type) VALUES (?, ?)", (title, test_type))
+        cursor.execute("INSERT INTO tests (title, test_type) VALUES (?, ?)", (title, data.get("test_type")))
         conn.commit()
         test_id = cursor.lastrowid
     except sqlite3.IntegrityError:
@@ -217,8 +218,21 @@ async def process_test_title(message: Message, state: FSMContext):
     conn.close()
 
     await state.update_data(test_id=test_id)
-    await message.answer(f"آزمون «{title}» ایجاد شد.\n\nفایل صوتی سگمنت شماره ۱ را ارسال کنید:")
+    
+    # پرسش زبان سگمنت قبل از آپلود صوت
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="انگلیسی 🇬🇧", callback_data="lang_en"), InlineKeyboardButton(text="فارسی 🇮🇷", callback_data="lang_fa")]
+    ])
+    await message.answer(f"آزمون «{title}» ایجاد شد.\n\nزبان سگمنت شماره {seg_index} را انتخاب کنید:", reply_markup=keyboard)
+
+@dp.callback_query(F.data.startswith("lang_"))
+async def process_segment_lang(callback: CallbackQuery, state: FSMContext):
+    lang = callback.data.split("_")[1]
+    await state.update_data(segment_lang=lang)
+    lang_name = "انگلیسی 🇬🇧" if lang == "en" else "فارسی 🇮🇷"
+    await callback.message.answer(f"زبان انتخاب شده: {lang_name}\n\nحالا فایل صوتی این سگمنت را ارسال کنید:")
     await state.set_state(AdminStates.waiting_for_segment_audio)
+    await callback.answer()
 
 @dp.message(AdminStates.waiting_for_segment_audio, F.voice | F.audio | F.document)
 async def process_segment_audio(message: Message, state: FSMContext):
@@ -234,37 +248,30 @@ async def process_segment_key(message: Message, state: FSMContext):
     file_id = data.get("file_id")
     answer_key = message.text
     seg_index = data.get("segment_index")
-    test_type = data.get("test_type")
+    segment_lang = data.get("segment_lang")
 
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO segments (test_id, file_id, answer_key, segment_index) VALUES (?, ?, ?, ?)", (test_id, file_id, answer_key, seg_index))
+    cursor.execute("INSERT INTO segments (test_id, file_id, answer_key, segment_index, segment_lang) VALUES (?, ?, ?, ?, ?)", (test_id, file_id, answer_key, seg_index, segment_lang))
     conn.commit()
     conn.close()
 
-    if test_type == "placement" and seg_index == 1:
-        await state.update_data(segment_index=2)
-        await message.answer("سگمنت اول (انگلیسی) ثبت شد.\n\nحالا فایل صوتی سگمنت دوم (فارسی) را ارسال کنید:")
-        await state.set_state(AdminStates.waiting_for_segment_audio)
-    else:
-        if test_type == "mock":
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="افزودن سگمنت بعدی", callback_data="admin_add_more_segment")],
-                [InlineKeyboardButton(text="پایان بارگذاری", callback_data="admin_finish_test")]
-            ])
-            await message.answer(f"سگمنت شماره {seg_index} ثبت شد. مایلید چه کاری انجام دهید؟", reply_markup=keyboard)
-        else:
-            await state.clear()
-            await message.answer("آزمون تعیین سطح با موفقیت کامل ایجاد شد!")
-            await show_admin_panel(message)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="افزودن سگمنت بعدی", callback_data="admin_add_more_segment")],
+        [InlineKeyboardButton(text="پایان بارگذاری", callback_data="admin_finish_test")]
+    ])
+    await message.answer(f"سگمنت شماره {seg_index} ثبت شد. مایلید چه کاری انجام دهید؟", reply_markup=keyboard)
 
 @dp.callback_query(F.data == "admin_add_more_segment")
 async def admin_add_more_segment(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     new_index = data.get("segment_index") + 1
     await state.update_data(segment_index=new_index)
-    await callback.message.answer(f"فایل صوتی سگمنت شماره {new_index} را ارسال کنید:")
-    await state.set_state(AdminStates.waiting_for_segment_audio)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="انگلیسی 🇬🇧", callback_data="lang_en"), InlineKeyboardButton(text="فارسی 🇮🇷", callback_data="lang_fa")]
+    ])
+    await callback.message.answer(f"زبان سگمنت شماره {new_index} را انتخاب کنید:", reply_markup=keyboard)
     await callback.answer()
 
 @dp.callback_query(F.data == "admin_finish_test")
@@ -307,7 +314,6 @@ async def admin_clear_db(callback: CallbackQuery):
 
 @dp.message(UserTestStates.taking_test, F.voice)
 async def handle_user_voice_test(message: Message, state: FSMContext):
-    # بررسی بلاک بودن کاربر در حین آزمون
     conn_chk = sqlite3.connect("bot_database.db")
     cur_chk = conn_chk.cursor()
     cur_chk.execute("SELECT is_blocked FROM admins WHERE user_id = ?", (message.from_user.id,))
@@ -324,7 +330,7 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
     curr_idx = data.get("current_index")
     session_results = data.get("session_results")
 
-    seg_id, file_id, answer_key = segments[curr_idx]
+    seg_id, file_id, answer_key, segment_lang = segments[curr_idx]
     status_msg = await message.answer(f"در حال پردازش سگمنت {curr_idx + 1}...")
     file_path = f"voice_{message.from_user.id}.ogg"
 
@@ -343,11 +349,12 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
 
 نوع آزمون: {test_type}
 شماره سگمنت: {curr_idx + 1}
+زبان فایل صوتی مرجع: {segment_lang}
 """
 
         if test_type == "placement":
             system_prompt += """
-ارزیابی خود را برای تعیین سطح انجام بده و خروجی را دقیقاً با این فرمت ارسال کن:
+ارزیابی خود را انجام بده و خروجی را دقیقاً با این فرمت ارسال کن:
 
 نتیجه ارزیابی سگمنت 
 متن مرجع:
@@ -416,8 +423,8 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
         if next_idx < len(segments):
             await state.update_data(current_index=next_idx, session_results=session_results)
             next_seg = segments[next_idx]
-            lang_label = "فارسی به انگلیسی 🇮🇷 ➡️ 🇬🇧" if test_type == "placement" else f"سگمنت شماره {next_idx + 1}"
-            await message.answer(f"سگمنت {curr_idx + 1} ثبت شد.\n\n{lang_label}:\nبه فایل صوتی گوش دهید:")
+            lang_dir = "انگلیسی به فارسی 🇬🇧 ➡️ 🇮🇷" if next_seg[3] == "en" else "فارسی به انگلیسی 🇮🇷 ➡️ 🇬🇧"
+            await message.answer(f"سگمنت {curr_idx + 1} ثبت شد.\n\nسگمنت {next_idx + 1} ({lang_dir}):\nبه فایل صوتی گوش دهید:")
             try:
                 await message.answer_voice(voice=next_seg[1])
             except:
@@ -552,7 +559,7 @@ async def start_web_server():
 
 async def main():
     await start_web_server()
-    logging.info("Starting bot with admin security and placement features...")
+    logging.info("Starting bot with flexible segments and language selector...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
