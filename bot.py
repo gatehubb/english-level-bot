@@ -3,7 +3,6 @@ import asyncio
 import logging
 import sqlite3
 import zipfile
-import json
 import shutil
 import threading
 from flask import Flask
@@ -25,7 +24,6 @@ CHANNEL_LINK = "https://t.me/YourChannelUsername"
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# راه‌اندازی وب‌سرور سبک Flask برای راضی نگه داشتن پورت رندر
 app = Flask(__name__)
 
 @app.route("/")
@@ -220,9 +218,10 @@ async def process_test_type(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_test_title)
     await callback.answer()
 
+# ---------- آپلود و استخراج مستقیم از فایل متنی و پوشه صوت‌ها ----------
 @dp.callback_query(F.data == "admin_upload_zip")
 async def admin_upload_zip(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer("لطفاً فایل فشرده (.zip) شامل پوشه صوتی و متادیتا را ارسال کنید.")
+    await callback.message.answer("لطفاً فایل زیپ (.zip) شامل یک فایل متنی (.txt) و پوشه فایل‌های صوتی را ارسال کنید.")
     await state.set_state(AdminStates.waiting_for_zip_file)
     await callback.answer()
 
@@ -232,7 +231,7 @@ async def process_zip_upload(message: Message, state: FSMContext):
         await message.answer("❌ لطفاً یک فایل با پسوند .zip ارسال کنید.")
         return
 
-    status_msg = await message.answer("📥 در حال استخراج و تحلیل فایل زیپ...")
+    status_msg = await message.answer("📥 در حال خواندن متون و صوت‌ها از فایل زیپ...")
     file_id = message.document.file_id
     file = await bot.get_file(file_id)
     
@@ -246,75 +245,73 @@ async def process_zip_upload(message: Message, state: FSMContext):
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(extract_dir)
 
-        metadata_path = None
-        audio_dir = None
-        
-        for root, dirs, files in os.walk(extract_dir):
-            if "dialogue_metadata.json" in files:
-                metadata_path = os.path.join(root, "dialogue_metadata.json")
-            if any(f.endswith(('.mp3', '.ogg', '.wav')) for f in files):
-                audio_dir = root
+        txt_file_path = None
+        audio_files = []
 
-        if not metadata_path:
-            await status_msg.edit_text("❌ فایل dialogue_metadata.json داخل فایل زیپ یافت نشد.")
+        for root, dirs, files in os.walk(extract_dir):
+            for file in files:
+                if file.endswith('.txt') and not txt_file_path:
+                    txt_file_path = os.path.join(root, file)
+                elif file.endswith(('.mp3', '.ogg', '.wav')):
+                    audio_files.append(os.path.join(root, file))
+
+        if not txt_file_path:
+            await status_msg.edit_text("❌ هیچ فایل متنی (.txt) ای داخل فایل زیپ پیدا نشد.")
             shutil.rmtree(extract_dir)
             await state.clear()
             return
 
-        with open(metadata_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        # خواندن خط به خط متن‌ها از فایل txt
+        with open(txt_file_path, 'r', encoding='utf-8') as f:
+            lines = [line.strip() for line in f.readlines() if line.strip()]
 
-        title = data.get("title", "New Dialogue Table")
-        test_type = data.get("test_type", "mock")
-        dialogues = data.get("dialogues", [])
+        if not audio_files:
+            await status_msg.edit_text("❌ هیچ فایل صوتی‌ای داخل پوشه‌ها پیدا نشد.")
+            shutil.rmtree(extract_dir)
+            await state.clear()
+            return
+
+        # مرتب‌سازی فایل‌های صوتی بر اساس نام
+        audio_files.sort()
+
+        test_title = message.document.file_name.replace('.zip', '')
+        test_type = "mock"
 
         conn = sqlite3.connect("bot_database.db")
         cursor = conn.cursor()
-        cursor.execute("SELECT id FROM tests WHERE title = ?", (title,))
+        cursor.execute("SELECT id FROM tests WHERE title = ?", (test_title,))
         existing_test = cursor.fetchone()
         
         if existing_test:
             test_id = existing_test[0]
             cursor.execute("DELETE FROM segments WHERE test_id = ?", (test_id,))
         else:
-            cursor.execute("INSERT INTO tests (title, test_type) VALUES (?, ?)", (title, test_type))
+            cursor.execute("INSERT INTO tests (title, test_type) VALUES (?, ?)", (test_title, test_type))
             conn.commit()
             test_id = cursor.lastrowid
 
         total_segments = 0
-        for item in dialogues:
-            idx = item.get("segment_index", 1)
-            lang = item.get("language", "en")
-            answer_key = item.get("answer_text", "")
-            audio_filename = item.get("audio_file", "")
+        # جفت کردن متون با فایل‌های صوتی به ترتیب
+        for idx, audio_path in enumerate(audio_files, start=1):
+            answer_key = lines[idx - 1] if (idx - 1) < len(lines) else f"Segment {idx} text"
+            # تشخیص خودکار زبان (مثلاً فرد انگلیسی، زوج فارسی یا بالعکس)
+            lang = "en" if idx % 2 != 0 else "fa"
 
-            audio_full_path = None
-            if audio_dir:
-                candidate = os.path.join(audio_dir, audio_filename)
-                if os.path.exists(candidate):
-                    audio_full_path = candidate
-            
-            if not audio_full_path:
-                for root, dirs, files in os.walk(extract_dir):
-                    if audio_filename in files:
-                        audio_full_path = os.path.join(root, audio_filename)
-                        break
+            sent_msg = await message.answer_audio(audio=FSInputFile(audio_path), caption=f"بارگذاری سگمنت {idx}")
+            tg_file_id = sent_msg.audio.file_id
+            await sent_msg.delete()
 
-            if audio_full_path and os.path.exists(audio_full_path):
-                sent_msg = await message.answer_audio(audio=FSInputFile(audio_full_path), caption=f"بارگذاری سگمنت {idx}")
-                tg_file_id = sent_msg.audio.file_id
-                await sent_msg.delete()
-
-                cursor.execute(
-                    "INSERT INTO segments (test_id, file_id, answer_key, segment_index, segment_lang) VALUES (?, ?, ?, ?, ?)",
-                    (test_id, tg_file_id, answer_key, idx, lang)
-                )
-                conn.commit()
-                total_segments += 1
+            cursor.execute(
+                "INSERT INTO segments (test_id, file_id, answer_key, segment_index, segment_lang) VALUES (?, ?, ?, ?, ?)",
+                (test_id, tg_file_id, answer_key, idx, lang)
+            )
+            conn.commit()
+            total_segments += 1
 
         conn.close()
         shutil.rmtree(extract_dir)
-        await status_msg.edit_text(f"✅ آزمون «{title}» با موفقیت همراه با {total_segments} سگمنت بارگذاری و ذخیره شد!")
+        
+        await status_msg.edit_text(f"✅ آزمون «{test_title}» با موفقیت همراه با **{total_segments} سگمنت** (برگرفته از فایل متنی و صوت‌ها) ذخیره شد!")
         await state.clear()
         await show_admin_panel(message)
 
@@ -868,7 +865,6 @@ async def show_detailed_report(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 async def main():
-    # اجرای وب‌سرور Flask در یک ترد (Thread) مستقل برای رفع خطای پورت رندر
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logging.info("Flask web server started in background thread for Render port binding.")
