@@ -4,6 +4,7 @@ import logging
 import sqlite3
 import zipfile
 import shutil
+import re
 import threading
 from flask import Flask
 from aiogram import Bot, Dispatcher, F
@@ -39,7 +40,7 @@ def init_db():
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY, failed_attempts INTEGER DEFAULT 0, is_blocked INTEGER DEFAULT 0)")
     cursor.execute("CREATE TABLE IF NOT EXISTS tests (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT UNIQUE, test_type TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-    cursor.execute("CREATE TABLE IF NOT EXISTS segments (id INTEGER PRIMARY KEY AUTOINCREMENT, test_id INTEGER, file_id TEXT, answer_key TEXT, segment_index INTEGER, segment_lang TEXT, FOREIGN KEY(test_id) REFERENCES tests(id) ON DELETE CASCADE)")
+    cursor.execute("CREATE TABLE IF NOT EXISTS segments (id INTEGER PRIMARY KEY AUTOINCREMENT, test_id INTEGER, file_id TEXT, answer_key TEXT, segment_index INTEGER, segment_lang TEXT, speaker_info TEXT, FOREIGN KEY(test_id) REFERENCES tests(id) ON DELETE CASCADE)")
     cursor.execute("CREATE TABLE IF NOT EXISTS results (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, test_title TEXT, analysis TEXT, date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     conn.commit()
     conn.close()
@@ -218,10 +219,10 @@ async def process_test_type(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_test_title)
     await callback.answer()
 
-# ---------- آپلود و استخراج مستقیم از فایل متنی و پوشه صوت‌ها ----------
+# ---------- تجزیه و تحلیل دقیق و هوشمند فایل متنی و فایل‌های صوتی زیپ ----------
 @dp.callback_query(F.data == "admin_upload_zip")
 async def admin_upload_zip(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer("لطفاً فایل زیپ (.zip) شامل یک فایل متنی (.txt) و پوشه فایل‌های صوتی را ارسال کنید.")
+    await callback.message.answer("لطفاً فایل زیپ (.zip) شامل اسکریپت متنی و پوشه صوت‌ها را ارسال کنید.")
     await state.set_state(AdminStates.waiting_for_zip_file)
     await callback.answer()
 
@@ -231,7 +232,7 @@ async def process_zip_upload(message: Message, state: FSMContext):
         await message.answer("❌ لطفاً یک فایل با پسوند .zip ارسال کنید.")
         return
 
-    status_msg = await message.answer("📥 در حال خواندن متون و صوت‌ها از فایل زیپ...")
+    status_msg = await message.answer("📥 در حال استخراج و تحلیل ساختار فایل متنی و صوت‌ها...")
     file_id = message.document.file_id
     file = await bot.get_file(file_id)
     
@@ -246,14 +247,14 @@ async def process_zip_upload(message: Message, state: FSMContext):
             zip_ref.extractall(extract_dir)
 
         txt_file_path = None
-        audio_files = []
+        audio_files_map = {}
 
         for root, dirs, files in os.walk(extract_dir):
             for file in files:
                 if file.endswith('.txt') and not txt_file_path:
                     txt_file_path = os.path.join(root, file)
                 elif file.endswith(('.mp3', '.ogg', '.wav')):
-                    audio_files.append(os.path.join(root, file))
+                    audio_files_map[file] = os.path.join(root, file)
 
         if not txt_file_path:
             await status_msg.edit_text("❌ هیچ فایل متنی (.txt) ای داخل فایل زیپ پیدا نشد.")
@@ -261,21 +262,56 @@ async def process_zip_upload(message: Message, state: FSMContext):
             await state.clear()
             return
 
-        # خواندن خط به خط متن‌ها از فایل txt
+        # خواندن محتوای فایل متنی به صورت کامل
         with open(txt_file_path, 'r', encoding='utf-8') as f:
-            lines = [line.strip() for line in f.readlines() if line.strip()]
+            content = f.read()
 
-        if not audio_files:
-            await status_msg.edit_text("❌ هیچ فایل صوتی‌ای داخل پوشه‌ها پیدا نشد.")
+        # استخراج عنوان آزمون از داخل متن یا نام فایل
+        title_match = re.search(r'Title:\s*(.+)', content)
+        test_title = title_match.group(1).strip() if title_match else message.document.file_name.replace('.zip', '')
+        test_type = "mock"
+
+        # تفکیک بلوک‌های سگمنت بر اساس خطوط جداکننده یا تگ [Segment]
+        blocks = content.split('--------------------------------------------------')
+        dialogues_data = []
+
+        for block in blocks:
+            if '[Segment' in block:
+                # شماره سگمنت
+                idx_match = re.search(r'\[Segment\s+(\d+)\]', block)
+                if not idx_match:
+                    continue
+                idx = int(idx_match.group(1))
+
+                # عنوان گوینده (مثل RICK (ADVISOR - BRITISH ENGLISH) (ENGLISH))
+                header_match = re.search(r'\[Segment\s+\d+\]\s*-\s*(.*)', block)
+                speaker_info = header_match.group(1).strip() if header_match else f"Segment {idx}"
+
+                # تشخیص زبان بر اساس تگ داخل عنوان
+                lang = "en" if "(ENGLISH)" in speaker_info.upper() else "fa"
+
+                # متن پاسخ مرجع (Answer Text)
+                ans_match = re.search(r'Answer Text \(Model Interpretation\):\s*(.*?)(?=\nAudio File:|$)', block, re.DOTALL)
+                answer_text = ans_match.group(1).strip() if ans_match else ""
+
+                # نام فایل صوتی مربوطه
+                audio_match = re.search(r'Audio File:\s*([^\s]+)', block)
+                audio_filename = audio_match.group(1).strip() if audio_match else ""
+
+                if audio_filename and answer_text:
+                    dialogues_data.append({
+                        "index": idx,
+                        "lang": lang,
+                        "speaker_info": speaker_info,
+                        "answer_text": answer_text,
+                        "audio_filename": audio_filename
+                    })
+
+        if not dialogues_data:
+            await status_msg.edit_text("❌ ساختار فایل متنی شناسایی نشد یا هیچ سگمنتی استخراج نشد.")
             shutil.rmtree(extract_dir)
             await state.clear()
             return
-
-        # مرتب‌سازی فایل‌های صوتی بر اساس نام
-        audio_files.sort()
-
-        test_title = message.document.file_name.replace('.zip', '')
-        test_type = "mock"
 
         conn = sqlite3.connect("bot_database.db")
         cursor = conn.cursor()
@@ -291,27 +327,32 @@ async def process_zip_upload(message: Message, state: FSMContext):
             test_id = cursor.lastrowid
 
         total_segments = 0
-        # جفت کردن متون با فایل‌های صوتی به ترتیب
-        for idx, audio_path in enumerate(audio_files, start=1):
-            answer_key = lines[idx - 1] if (idx - 1) < len(lines) else f"Segment {idx} text"
-            # تشخیص خودکار زبان (مثلاً فرد انگلیسی، زوج فارسی یا بالعکس)
-            lang = "en" if idx % 2 != 0 else "fa"
+        for item in dialogues_data:
+            audio_full_path = audio_files_map.get(item["audio_filename"])
+            
+            # اگر نام فایل دقیقا مچ نشد، جستجوی نسبی انجام دهیم
+            if not audio_full_path:
+                for fname, fpath in audio_files_map.items():
+                    if item["audio_filename"].lower() in fname.lower():
+                        audio_full_path = fpath
+                        break
 
-            sent_msg = await message.answer_audio(audio=FSInputFile(audio_path), caption=f"بارگذاری سگمنت {idx}")
-            tg_file_id = sent_msg.audio.file_id
-            await sent_msg.delete()
+            if audio_full_path and os.path.exists(audio_full_path):
+                sent_msg = await message.answer_audio(audio=FSInputFile(audio_full_path), caption=f"بارگذاری سگمنت {item['index']}")
+                tg_file_id = sent_msg.audio.file_id
+                await sent_msg.delete()
 
-            cursor.execute(
-                "INSERT INTO segments (test_id, file_id, answer_key, segment_index, segment_lang) VALUES (?, ?, ?, ?, ?)",
-                (test_id, tg_file_id, answer_key, idx, lang)
-            )
-            conn.commit()
-            total_segments += 1
+                cursor.execute(
+                    "INSERT INTO segments (test_id, file_id, answer_key, segment_index, segment_lang, speaker_info) VALUES (?, ?, ?, ?, ?, ?)",
+                    (test_id, tg_file_id, item["answer_text"], item["index"], item["lang"], item["speaker_info"])
+                )
+                conn.commit()
+                total_segments += 1
 
         conn.close()
         shutil.rmtree(extract_dir)
         
-        await status_msg.edit_text(f"✅ آزمون «{test_title}» با موفقیت همراه با **{total_segments} سگمنت** (برگرفته از فایل متنی و صوت‌ها) ذخیره شد!")
+        await status_msg.edit_text(f"✅ آزمون «{test_title}» با موفقیت همراه با **{total_segments} سگمنت** و تطبیق دقیق صوت‌ها و پاسخ‌ها ذخیره شد!")
         await state.clear()
         await show_admin_panel(message)
 
@@ -354,7 +395,7 @@ async def manage_single_test(callback: CallbackQuery, state: FSMContext):
     test_row = cursor.fetchone()
     test_title, test_type = test_row
 
-    cursor.execute("SELECT id, segment_index, segment_lang, answer_key FROM segments WHERE test_id = ? ORDER BY segment_index ASC", (test_id,))
+    cursor.execute("SELECT id, segment_index, segment_lang, speaker_info, answer_key FROM segments WHERE test_id = ? ORDER BY segment_index ASC", (test_id,))
     segments = cursor.fetchall()
     conn.close()
 
@@ -363,9 +404,10 @@ async def manage_single_test(callback: CallbackQuery, state: FSMContext):
     buttons = [
         [InlineKeyboardButton(text="✏️ ویرایش نام این آزمون (ماک)", callback_data=f"edit_test_title_{test_id}")]
     ]
-    for seg_id, index, lang, key in segments:
-        short_key = (key[:25] + '...') if len(key) > 25 else key
-        buttons.append([InlineKeyboardButton(text=f"سگمنت {index} ({lang}) - {short_key}", callback_data=f"edit_seg_{seg_id}")])
+    for seg_id, index, lang, speaker, key in segments:
+        label = speaker if speaker else f"Segment {index}"
+        short_label = (label[:35] + '...') if len(label) > 35 else label
+        buttons.append([InlineKeyboardButton(text=f"سگمنت {index}: {short_label}", callback_data=f"edit_seg_{seg_id}")])
 
     buttons.append([InlineKeyboardButton(text="🔙 بازگشت به لیست آزمون‌ها", callback_data="admin_manage_tests")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -408,7 +450,7 @@ async def edit_segment_options(callback: CallbackQuery, state: FSMContext):
     
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT segment_index, segment_lang, answer_key, test_id FROM segments WHERE id = ?", (seg_id,))
+    cursor.execute("SELECT segment_index, segment_lang, answer_key, test_id, speaker_info FROM segments WHERE id = ?", (seg_id,))
     seg = cursor.fetchone()
     conn.close()
 
@@ -416,7 +458,7 @@ async def edit_segment_options(callback: CallbackQuery, state: FSMContext):
         await callback.answer("سگمنت مورد نظر یافت نشد.", show_alert=True)
         return
 
-    index, lang, answer_key, test_id = seg
+    index, lang, answer_key, test_id, speaker = seg
     await state.update_data(editing_seg_id=seg_id, test_id=test_id)
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -427,8 +469,9 @@ async def edit_segment_options(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="🔙 بازگشت", callback_data=f"manage_test_{test_id}")]
     ])
 
+    speaker_text = f"\n**عنوان گوینده:** {speaker}" if speaker else ""
     await callback.message.edit_text(
-        f"مدیریت سگمنت شماره {index} (زبان: {lang}):\n\n**متن پاسخ فعلی:**\n{answer_key}\n\nلطفاً عملیات مورد نظر را انتخاب کنید:",
+        f"مدیریت سگمنت شماره {index} (زبان: {lang}):{speaker_text}\n\n**متن پاسخ فعلی:**\n{answer_key}\n\nلطفاً عملیات مورد نظر را انتخاب کنید:",
         reply_markup=keyboard
     )
     await callback.answer()
@@ -649,7 +692,7 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
     curr_idx = data.get("current_index")
     session_results = data.get("session_results")
 
-    seg_id, file_id, answer_key, segment_lang = segments[curr_idx]
+    seg_id, file_id, answer_key, segment_lang = segments[curr_idx][:4]
     status_msg = await message.answer(f"در حال پردازش سگمنت {curr_idx + 1}...")
     file_path = f"voice_{message.from_user.id}.ogg"
 
