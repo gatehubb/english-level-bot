@@ -54,6 +54,7 @@ class AdminStates(StatesGroup):
     waiting_for_segment_audio = State()
     waiting_for_segment_key = State()
     waiting_for_zip_file = State()
+    waiting_for_zip_test_type = State() # تعیین نوع آزمون زیپ
     editing_answer_key = State()
     editing_audio = State()
     editing_test_title = State()
@@ -102,7 +103,7 @@ async def user_start_test(callback: CallbackQuery, state: FSMContext):
     cursor.execute("SELECT title, test_type FROM tests WHERE id = ?", (test_id,))
     test_row = cursor.fetchone()
     
-    cursor.execute("SELECT id, file_id, answer_key, segment_lang FROM segments WHERE test_id = ? ORDER BY segment_index ASC", (test_id,))
+    cursor.execute("SELECT id, file_id, answer_key, segment_lang, speaker_info FROM segments WHERE test_id = ? ORDER BY segment_index ASC", (test_id,))
     segments = cursor.fetchall()
     conn.close()
 
@@ -126,7 +127,16 @@ async def user_start_test(callback: CallbackQuery, state: FSMContext):
     first_seg = segments[0]
     lang_dir = "انگلیسی به فارسی 🇬🇧 ➡️ 🇮🇷" if first_seg[3] == "en" else "فارسی به انگلیسی 🇮🇷 ➡️ 🇬🇧"
     
-    await callback.message.answer(f"آغاز آزمون: {test_title}\n\nسگمنت ۱ از {len(segments)} ({lang_dir}):\nبه فایل صوتی زیر گوش دهید و ترجمه آن را به صورت ویس ارسال کنید:")
+    # ارسال توصیه/تیپ قبل از پخش فایل صوتی سگمنت اول
+    tip_text = (
+        f"💡 **نکته و توصیه آزمون:**\n"
+        f"• حتماً کاغذ و قلم همراه داشته باشید تا نکات و اعداد کلیدی را یادداشت کنید.\n"
+        f"• نیازی نیست تک‌تک کلمات را موبه‌مو ترجمه کنید؛ انتقال مفهوم دقیق، اعداد و اسامی اهمیت اصلی را دارد.\n\n"
+        f"🎧 **سگمنت ۱ از {len(segments)}** ({lang_dir})\n"
+        f"گوينده: {first_seg[4] if first_seg[4] else 'گوینده اصلی'}\n\n"
+        f"به فایل صوتی زیر گوش دهید و ترجمه خود را به صورت ویس ارسال کنید:"
+    )
+    await callback.message.answer(tip_text)
     
     try:
         await callback.message.answer_voice(voice=first_seg[1])
@@ -219,7 +229,7 @@ async def process_test_type(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_test_title)
     await callback.answer()
 
-# ---------- تجزیه و تحلیل دقیق و هوشمند فایل متنی و فایل‌های صوتی زیپ ----------
+# ---------- آپلود فایل زیپ و پرسش نوع آزمون ----------
 @dp.callback_query(F.data == "admin_upload_zip")
 async def admin_upload_zip(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer("لطفاً فایل زیپ (.zip) شامل اسکریپت متنی و پوشه صوت‌ها را ارسال کنید.")
@@ -227,25 +237,38 @@ async def admin_upload_zip(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 @dp.message(AdminStates.waiting_for_zip_file, F.document)
-async def process_zip_upload(message: Message, state: FSMContext):
+async def process_zip_upload_file(message: Message, state: FSMContext):
     if not message.document.file_name.endswith('.zip'):
         await message.answer("❌ لطفاً یک فایل با پسوند .zip ارسال کنید.")
         return
 
-    status_msg = await message.answer("📥 در حال استخراج و تحلیل ساختار فایل متنی و صوت‌ها...")
     file_id = message.document.file_id
     file = await bot.get_file(file_id)
-    
     extract_dir = f"temp_zip_{message.from_user.id}"
     os.makedirs(extract_dir, exist_ok=True)
     zip_path = os.path.join(extract_dir, "uploaded.zip")
-    
     await bot.download_file(file.file_path, zip_path)
 
-    try:
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(extract_dir)
+    await state.update_data(extract_dir=extract_dir, zip_filename=message.document.file_name)
 
+    # پرسش نوع آزمون پس از دریافت فایل زیپ
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎯 آزمون تعیین سطح", callback_data="ziptype_placement"),
+         InlineKeyboardButton(text="📝 ماک کامل", callback_data="ziptype_mock")]
+    ])
+    await message.answer("این فایل زیپ مربوط به چه نوع آزمونی است؟", reply_markup=keyboard)
+    await state.set_state(AdminStates.waiting_for_zip_test_type)
+
+@dp.callback_query(AdminStates.waiting_for_zip_test_type, F.data.startswith("ziptype_"))
+async def process_zip_test_type(callback: CallbackQuery, state: FSMContext):
+    test_type = callback.data.split("_")[1] # placement یا mock
+    data = await state.get_data()
+    extract_dir = data.get("extract_dir")
+    zip_filename = data.get("zip_filename")
+
+    status_msg = await callback.message.edit_text("📥 در حال استخراج و تحلیل ساختار فایل متنی و صوت‌ها...")
+
+    try:
         txt_file_path = None
         audio_files_map = {}
 
@@ -262,39 +285,30 @@ async def process_zip_upload(message: Message, state: FSMContext):
             await state.clear()
             return
 
-        # خواندن محتوای فایل متنی به صورت کامل
         with open(txt_file_path, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        # استخراج عنوان آزمون از داخل متن یا نام فایل
         title_match = re.search(r'Title:\s*(.+)', content)
-        test_title = title_match.group(1).strip() if title_match else message.document.file_name.replace('.zip', '')
-        test_type = "mock"
+        test_title = title_match.group(1).strip() if title_match else zip_filename.replace('.zip', '')
 
-        # تفکیک بلوک‌های سگمنت بر اساس خطوط جداکننده یا تگ [Segment]
         blocks = content.split('--------------------------------------------------')
         dialogues_data = []
 
         for block in blocks:
             if '[Segment' in block:
-                # شماره سگمنت
                 idx_match = re.search(r'\[Segment\s+(\d+)\]', block)
                 if not idx_match:
                     continue
                 idx = int(idx_match.group(1))
 
-                # عنوان گوینده (مثل RICK (ADVISOR - BRITISH ENGLISH) (ENGLISH))
                 header_match = re.search(r'\[Segment\s+\d+\]\s*-\s*(.*)', block)
                 speaker_info = header_match.group(1).strip() if header_match else f"Segment {idx}"
 
-                # تشخیص زبان بر اساس تگ داخل عنوان
                 lang = "en" if "(ENGLISH)" in speaker_info.upper() else "fa"
 
-                # متن پاسخ مرجع (Answer Text)
                 ans_match = re.search(r'Answer Text \(Model Interpretation\):\s*(.*?)(?=\nAudio File:|$)', block, re.DOTALL)
                 answer_text = ans_match.group(1).strip() if ans_match else ""
 
-                # نام فایل صوتی مربوطه
                 audio_match = re.search(r'Audio File:\s*([^\s]+)', block)
                 audio_filename = audio_match.group(1).strip() if audio_match else ""
 
@@ -321,6 +335,7 @@ async def process_zip_upload(message: Message, state: FSMContext):
         if existing_test:
             test_id = existing_test[0]
             cursor.execute("DELETE FROM segments WHERE test_id = ?", (test_id,))
+            cursor.execute("UPDATE tests SET test_type = ? WHERE id = ?", (test_type, test_id))
         else:
             cursor.execute("INSERT INTO tests (title, test_type) VALUES (?, ?)", (test_title, test_type))
             conn.commit()
@@ -329,8 +344,6 @@ async def process_zip_upload(message: Message, state: FSMContext):
         total_segments = 0
         for item in dialogues_data:
             audio_full_path = audio_files_map.get(item["audio_filename"])
-            
-            # اگر نام فایل دقیقا مچ نشد، جستجوی نسبی انجام دهیم
             if not audio_full_path:
                 for fname, fpath in audio_files_map.items():
                     if item["audio_filename"].lower() in fname.lower():
@@ -338,7 +351,7 @@ async def process_zip_upload(message: Message, state: FSMContext):
                         break
 
             if audio_full_path and os.path.exists(audio_full_path):
-                sent_msg = await message.answer_audio(audio=FSInputFile(audio_full_path), caption=f"بارگذاری سگمنت {item['index']}")
+                sent_msg = await callback.message.answer_audio(audio=FSInputFile(audio_full_path), caption=f"بارگذاری سگمنت {item['index']}")
                 tg_file_id = sent_msg.audio.file_id
                 await sent_msg.delete()
 
@@ -352,15 +365,17 @@ async def process_zip_upload(message: Message, state: FSMContext):
         conn.close()
         shutil.rmtree(extract_dir)
         
-        await status_msg.edit_text(f"✅ آزمون «{test_title}» با موفقیت همراه با **{total_segments} سگمنت** و تطبیق دقیق صوت‌ها و پاسخ‌ها ذخیره شد!")
+        type_label_txt = "تعیین سطح" if test_type == "placement" else "ماک کامل"
+        await status_msg.edit_text(f"✅ آزمون «{test_title}» به عنوان **{type_label_txt}** همراه با **{total_segments} سگمنت** با موفقیت ذخیره شد!")
         await state.clear()
-        await show_admin_panel(message)
+        await show_admin_panel(callback.message)
 
     except Exception as e:
         if os.path.exists(extract_dir):
             shutil.rmtree(extract_dir)
         await status_msg.edit_text(f"❌ خطا در پردازش فایل زیپ:\n{str(e)}")
         await state.clear()
+    await callback.answer()
 
 @dp.callback_query(F.data == "admin_manage_tests")
 async def admin_manage_tests(callback: CallbackQuery, state: FSMContext):
@@ -692,7 +707,9 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
     curr_idx = data.get("current_index")
     session_results = data.get("session_results")
 
-    seg_id, file_id, answer_key, segment_lang = segments[curr_idx][:4]
+    seg_tuple = segments[curr_idx]
+    seg_id, file_id, answer_key, segment_lang, speaker_info = seg_tuple[0], seg_tuple[1], seg_tuple[2], seg_tuple[3], seg_tuple[4]
+
     status_msg = await message.answer(f"در حال پردازش سگمنت {curr_idx + 1}...")
     file_path = f"voice_{message.from_user.id}.ogg"
 
@@ -786,7 +803,17 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
             await state.update_data(current_index=next_idx, session_results=session_results)
             next_seg = segments[next_idx]
             lang_dir = "انگلیسی به فارسی 🇬🇧 ➡️ 🇮🇷" if next_seg[3] == "en" else "فارسی به انگلیسی 🇮🇷 ➡️ 🇬🇧"
-            await message.answer(f"سگمنت {curr_idx + 1} ثبت شد.\n\nسگمنت {next_idx + 1} ({lang_dir}):\nبه فایل صوتی گوش دهید:")
+            
+            # ارسال نکته و توصیه قبل از سگمنت بعدی
+            next_tip = (
+                f"💡 **توصیه برای سگمنت بعدی:**\n"
+                f"• آماده‌ی یادداشت‌برداری با کاغذ و قلم باشید.\n\n"
+                f"🎧 **سگمنت {next_idx + 1} از {len(segments)}** ({lang_dir})\n"
+                f"گوينده: {next_seg[4] if next_seg[4] else 'گوینده'}\n\n"
+                f"به فایل صوتی گوش دهید:"
+            )
+            await message.answer(next_tip)
+
             try:
                 await message.answer_voice(voice=next_seg[1])
             except:
