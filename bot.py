@@ -5,13 +5,14 @@ import sqlite3
 import zipfile
 import json
 import shutil
+import threading
+from flask import Flask
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from google import genai
-from aiohttp import web
 
 logging.basicConfig(level=logging.INFO)
 
@@ -23,6 +24,17 @@ CHANNEL_LINK = "https://t.me/YourChannelUsername"
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
+# راه‌اندازی وب‌سرور سبک Flask برای راضی نگه داشتن پورت رندر
+app = Flask(__name__)
+
+@app.route("/")
+def health_check():
+    return "Bot is running alive!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
 
 def init_db():
     conn = sqlite3.connect("bot_database.db")
@@ -208,7 +220,6 @@ async def process_test_type(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_test_title)
     await callback.answer()
 
-# ---------- آپلود و پردازش هوشمند فایل زیپ (سازگار با JSON و پوشه صوتی) ----------
 @dp.callback_query(F.data == "admin_upload_zip")
 async def admin_upload_zip(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer("لطفاً فایل فشرده (.zip) شامل پوشه صوتی و متادیتا را ارسال کنید.")
@@ -236,18 +247,16 @@ async def process_zip_upload(message: Message, state: FSMContext):
             zip_ref.extractall(extract_dir)
 
         metadata_path = None
-        audio_files_dict = {}
+        audio_dir = None
         
         for root, dirs, files in os.walk(extract_dir):
-            for file in files:
-                if file.endswith('.json'):
-                    metadata_path = os.path.join(root, file)
-                if file.endswith(('.mp3', '.ogg', '.wav', '.m4a')):
-                    # ذخیره نام فایل به همراه مسیر کامل آن
-                    audio_files_dict[file] = os.path.join(root, file)
+            if "dialogue_metadata.json" in files:
+                metadata_path = os.path.join(root, "dialogue_metadata.json")
+            if any(f.endswith(('.mp3', '.ogg', '.wav')) for f in files):
+                audio_dir = root
 
         if not metadata_path:
-            await status_msg.edit_text("❌ فایل متادیتا (JSON) داخل فایل زیپ یافت نشد.")
+            await status_msg.edit_text("❌ فایل dialogue_metadata.json داخل فایل زیپ یافت نشد.")
             shutil.rmtree(extract_dir)
             await state.clear()
             return
@@ -255,11 +264,9 @@ async def process_zip_upload(message: Message, state: FSMContext):
         with open(metadata_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
-        title = data.get("title") or data.get("test_title") or "New Dialogue Table"
-        test_type = data.get("test_type") or "mock"
-        
-        # پشتیبانی از نام‌های مختلف کلید سگمنت‌ها در جیسون (مثل dialogues یا segments یا items)
-        segments_list = data.get("dialogues") or data.get("segments") or data.get("items") or []
+        title = data.get("title", "New Dialogue Table")
+        test_type = data.get("test_type", "mock")
+        dialogues = data.get("dialogues", [])
 
         conn = sqlite3.connect("bot_database.db")
         cursor = conn.cursor()
@@ -275,24 +282,22 @@ async def process_zip_upload(message: Message, state: FSMContext):
             test_id = cursor.lastrowid
 
         total_segments = 0
-        for item in segments_list:
-            idx = item.get("segment_index") or item.get("index") or (total_segments + 1)
-            lang = item.get("language") or item.get("lang") or "en"
-            
-            # پیدا کردن متن پاسخ از کلیدهای مختلف احتمالی
-            answer_key = item.get("answer_text") or item.get("answer_key") or item.get("key") or item.get("text") or ""
-            
-            # پیدا کردن نام فایل صوتی
-            audio_filename = item.get("audio_file") or item.get("audio") or item.get("file") or ""
-            
+        for item in dialogues:
+            idx = item.get("segment_index", 1)
+            lang = item.get("language", "en")
+            answer_key = item.get("answer_text", "")
+            audio_filename = item.get("audio_file", "")
+
             audio_full_path = None
-            if audio_filename in audio_files_dict:
-                audio_full_path = audio_files_dict[audio_filename]
-            else:
-                # جستجوی فازی نام فایل در صورت تطابق نداشتن دقیق
-                for fname, fpath in audio_files_dict.items():
-                    if audio_filename and audio_filename in fname:
-                        audio_full_path = fpath
+            if audio_dir:
+                candidate = os.path.join(audio_dir, audio_filename)
+                if os.path.exists(candidate):
+                    audio_full_path = candidate
+            
+            if not audio_full_path:
+                for root, dirs, files in os.walk(extract_dir):
+                    if audio_filename in files:
+                        audio_full_path = os.path.join(root, audio_filename)
                         break
 
             if audio_full_path and os.path.exists(audio_full_path):
@@ -319,7 +324,6 @@ async def process_zip_upload(message: Message, state: FSMContext):
         await status_msg.edit_text(f"❌ خطا در پردازش فایل زیپ:\n{str(e)}")
         await state.clear()
 
-# ---------- مدیریت و ویرایش آزمون‌ها و سگمنت‌ها ----------
 @dp.callback_query(F.data == "admin_manage_tests")
 async def admin_manage_tests(callback: CallbackQuery, state: FSMContext):
     conn = sqlite3.connect("bot_database.db")
@@ -828,3 +832,49 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
 
     except Exception as e:
         await status_msg.edit_text(f"خطا در تحلیل:\n{str(e)}")
+    
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+@dp.callback_query(F.data == "check_channel_membership")
+async def check_channel_membership(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        if member.status in ["member", "administrator", "creator"]:
+            await callback.message.answer("عضویت شما تأیید شد!\n\nنقشه راه، متریال آموزشی و برنامه تمرینی شما:\n1. مرور واژگان تخصصی دپارتمان‌های دولتی\n2. تمرین یادداشت‌برداری نمادین\n3. استفاده از فایل‌های تمرینی کانال")
+            await state.clear()
+        else:
+            await callback.answer("شما هنوز در کانال عضو نشده‌اید!", show_alert=True)
+    except Exception as e:
+        await callback.answer("خطا در بررسی عضویت. مطمئن شوید ربات ادمین کانال است.", show_alert=True)
+
+@dp.callback_query(F.data == "show_detailed_report")
+async def show_detailed_report(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    session_results = data.get("session_results", [])
+    
+    if not session_results:
+        await callback.message.answer("اطلاعاتی برای نمایش موجود نیست.")
+        await callback.answer()
+        return
+
+    await callback.message.answer("گزارش کامل تحلیل تک‌تک سگمنت‌ها:")
+    for res in session_results:
+        await callback.message.answer(res)
+    
+    await state.clear()
+    await callback.answer()
+
+async def main():
+    # اجرای وب‌سرور Flask در یک ترد (Thread) مستقل برای رفع خطای پورت رندر
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logging.info("Flask web server started in background thread for Render port binding.")
+    
+    logging.info("Starting bot polling...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
