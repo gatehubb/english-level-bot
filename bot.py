@@ -43,9 +43,9 @@ class AdminStates(StatesGroup):
     waiting_for_segment_audio = State()
     waiting_for_segment_key = State()
     waiting_for_zip_file = State()
-    # حالت‌های ویرایش سگمنت
     editing_answer_key = State()
     editing_audio = State()
+    editing_test_title = State()
 
 class UserTestStates(StatesGroup):
     taking_test = State()
@@ -186,7 +186,7 @@ async def show_admin_panel(message: Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="ساخت آزمون دستی (گام به گام)", callback_data="admin_create_manual")],
         [InlineKeyboardButton(text="📥 آپلود آزمون با فایل زیپ (.zip)", callback_data="admin_upload_zip")],
-        [InlineKeyboardButton(text="✏️ مدیریت و ویرایش آزمون‌ها و سگمنت‌ها", callback_data="admin_manage_tests")],
+        [InlineKeyboardButton(text="✏️ مدیریت، ویرایش آزمون‌ها و سگمنت‌ها", callback_data="admin_manage_tests")],
         [InlineKeyboardButton(text="مشاهده نتایج کاربران", callback_data="admin_view_results")],
         [InlineKeyboardButton(text="پاکسازی کل اطلاعات", callback_data="admin_clear_db")]
     ])
@@ -208,10 +208,10 @@ async def process_test_type(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_test_title)
     await callback.answer()
 
-# ---------- بخش آپلود فایل زیپ (.zip) ----------
+# ---------- آپلود و پردازش فایل زیپ سازگار با ساختار استاندارد شما ----------
 @dp.callback_query(F.data == "admin_upload_zip")
 async def admin_upload_zip(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer("لطفاً فایل فشرده (.zip) شامل فایل‌های صوتی و اطلاعات آزمون را ارسال کنید.\n\n(ساختار باید شامل فایل متادیتا یا اسکریپت و پوشه صوت‌ها باشد)")
+    await callback.message.answer("لطفاً فایل فشرده (.zip) شامل پوشه صوتی و متادیتا را ارسال کنید.")
     await state.set_state(AdminStates.waiting_for_zip_file)
     await callback.answer()
 
@@ -221,7 +221,7 @@ async def process_zip_upload(message: Message, state: FSMContext):
         await message.answer("❌ لطفاً یک فایل با پسوند .zip ارسال کنید.")
         return
 
-    status_msg = await message.answer("📥 در حال دریافت و پردازش فایل زیپ...")
+    status_msg = await message.answer("📥 در حال استخراج و تحلیل فایل زیپ...")
     file_id = message.document.file_id
     file = await bot.get_file(file_id)
     
@@ -235,56 +235,60 @@ async def process_zip_upload(message: Message, state: FSMContext):
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(extract_dir)
 
-        # جستجو برای فایل متادیتا یا استخراج خودکار
-        json_path = None
-        audio_folder = None
+        metadata_path = None
+        audio_dir = None
         
         for root, dirs, files in os.walk(extract_dir):
-            for file in files:
-                if file.endswith('.json'):
-                    json_path = os.path.join(root, file)
-                if 'audio' in root.lower() or file.endswith(('.mp3', '.ogg', '.wav')):
-                    audio_folder = root
+            if "dialogue_metadata.json" in files:
+                metadata_path = os.path.join(root, "dialogue_metadata.json")
+            if any(f.endswith(('.mp3', '.ogg', '.wav')) for f in files):
+                audio_dir = root
 
-        if not json_path:
-            await status_msg.edit_text("❌ فایل متادیتا (JSON) داخل فایل زیپ پیدا نشد.")
+        if not metadata_path:
+            await status_msg.edit_text("❌ فایل dialogue_metadata.json داخل فایل زیپ یافت نشد.")
             shutil.rmtree(extract_dir)
             await state.clear()
             return
 
-        with open(json_path, 'r', encoding='utf-8') as f:
-            meta = json.load(f)
+        with open(metadata_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
 
-        title = meta.get("title", "آزمون وارد شده از زیپ")
-        test_type = meta.get("test_type", "mock")
-        segments_data = meta.get("segments", [])
+        title = data.get("title", "New Dialogue Table")
+        test_type = data.get("test_type", "mock")
+        dialogues = data.get("dialogues", [])
 
         conn = sqlite3.connect("bot_database.db")
         cursor = conn.cursor()
-        try:
+        cursor.execute("SELECT id FROM tests WHERE title = ?", (title,))
+        existing_test = cursor.fetchone()
+        
+        if existing_test:
+            test_id = existing_test[0]
+            cursor.execute("DELETE FROM segments WHERE test_id = ?", (test_id,))
+        else:
             cursor.execute("INSERT INTO tests (title, test_type) VALUES (?, ?)", (title, test_type))
             conn.commit()
             test_id = cursor.lastrowid
-        except sqlite3.IntegrityError:
-            conn.close()
-            await status_msg.edit_text("❌ آزمونی با همین عنوان قبلاً ثبت شده است.")
-            shutil.rmtree(extract_dir)
-            await state.clear()
-            return
 
-        for seg in segments_data:
-            idx = seg.get("index", 1)
-            lang = seg.get("lang", "en")
-            answer_key = seg.get("key", "")
-            audio_filename = seg.get("audio", "")
+        total_segments = 0
+        for item in dialogues:
+            idx = item.get("segment_index", 1)
+            lang = item.get("language", "en")
+            answer_key = item.get("answer_text", "")
+            audio_filename = item.get("audio_file", "")
 
-            # پیدا کردن فایل صوتی و آپلود موقت به تلگرام برای دریافت file_id
             audio_full_path = None
-            for root, dirs, files in os.walk(extract_dir):
-                if audio_filename in files:
-                    audio_full_path = os.path.join(root, audio_filename)
-                    break
+            if audio_dir:
+                candidate = os.path.join(audio_dir, audio_filename)
+                if os.path.exists(candidate):
+                    audio_full_path = candidate
             
+            if not audio_full_path:
+                for root, dirs, files in os.walk(extract_dir):
+                    if audio_filename in files:
+                        audio_full_path = os.path.join(root, audio_filename)
+                        break
+
             if audio_full_path and os.path.exists(audio_full_path):
                 sent_msg = await message.answer_audio(audio=FSInputFile(audio_full_path), caption=f"بارگذاری سگمنت {idx}")
                 tg_file_id = sent_msg.audio.file_id
@@ -295,10 +299,11 @@ async def process_zip_upload(message: Message, state: FSMContext):
                     (test_id, tg_file_id, answer_key, idx, lang)
                 )
                 conn.commit()
+                total_segments += 1
 
         conn.close()
         shutil.rmtree(extract_dir)
-        await status_msg.edit_text("✅ آزمون و تمامی سگمنت‌ها با موفقیت از طریق فایل زیپ ساخته و ذخیره شدند!")
+        await status_msg.edit_text(f"✅ آزمون «{title}» با موفقیت همراه با {total_segments} سگمنت بارگذاری و ذخیره شد!")
         await state.clear()
         await show_admin_panel(message)
 
@@ -308,7 +313,7 @@ async def process_zip_upload(message: Message, state: FSMContext):
         await status_msg.edit_text(f"❌ خطا در پردازش فایل زیپ:\n{str(e)}")
         await state.clear()
 
-# ---------- بخش مدیریت و ویرایش آزمون‌ها و سگمنت‌ها ----------
+# ---------- مدیریت و ویرایش آزمون‌ها و سگمنت‌ها (شامل ویرایش نام آزمون) ----------
 @dp.callback_query(F.data == "admin_manage_tests")
 async def admin_manage_tests(callback: CallbackQuery, state: FSMContext):
     conn = sqlite3.connect("bot_database.db")
@@ -329,7 +334,7 @@ async def admin_manage_tests(callback: CallbackQuery, state: FSMContext):
     
     buttons.append([InlineKeyboardButton(text="🔙 بازگشت به پنل", callback_data="admin_back_to_main")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await callback.message.edit_text("لطفاً آزمون مورد نظر جهت ویرایش یا مدیریت سگمنت‌ها را انتخاب کنید:", reply_markup=keyboard)
+    await callback.message.edit_text("لطفاً آزمون مورد نظر جهت ویرایش یا مدیریت را انتخاب کنید:", reply_markup=keyboard)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("manage_test_"))
@@ -338,14 +343,19 @@ async def manage_single_test(callback: CallbackQuery, state: FSMContext):
     
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT title FROM tests WHERE id = ?", (test_id,))
-    test_title = cursor.fetchone()[0]
+    cursor.execute("SELECT title, test_type FROM tests WHERE id = ?", (test_id,))
+    test_row = cursor.fetchone()
+    test_title, test_type = test_row
 
     cursor.execute("SELECT id, segment_index, segment_lang, answer_key FROM segments WHERE test_id = ? ORDER BY segment_index ASC", (test_id,))
     segments = cursor.fetchall()
     conn.close()
 
-    buttons = []
+    await state.update_data(managing_test_id=test_id)
+
+    buttons = [
+        [InlineKeyboardButton(text="✏️ ویرایش نام این آزمون (ماک)", callback_data=f"edit_test_title_{test_id}")]
+    ]
     for seg_id, index, lang, key in segments:
         short_key = (key[:25] + '...') if len(key) > 25 else key
         buttons.append([InlineKeyboardButton(text=f"سگمنت {index} ({lang}) - {short_key}", callback_data=f"edit_seg_{seg_id}")])
@@ -353,8 +363,37 @@ async def manage_single_test(callback: CallbackQuery, state: FSMContext):
     buttons.append([InlineKeyboardButton(text="🔙 بازگشت به لیست آزمون‌ها", callback_data="admin_manage_tests")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     
-    await callback.message.edit_text(f"مدیریت سگمنت‌های آزمون: **{test_title}**\n\nسگمنت مورد نظر برای ویرایش را انتخاب کنید:", reply_markup=keyboard)
+    await callback.message.edit_text(f"مدیریت آزمون: **{test_title}** ({test_type})\n\nسگمنت مورد نظر یا ویرایش نام را انتخاب کنید:", reply_markup=keyboard)
     await callback.answer()
+
+@dp.callback_query(F.data.startswith("edit_test_title_"))
+async def action_edit_test_title(callback: CallbackQuery, state: FSMContext):
+    test_id = int(callback.data.split("_")[3])
+    await state.update_data(editing_test_id=test_id)
+    await state.set_state(AdminStates.editing_test_title)
+    await callback.message.answer("عنوان جدید آزمون (ماک) را ارسال کنید:")
+    await callback.answer()
+
+@dp.message(AdminStates.editing_test_title, F.text)
+async def save_edited_test_title(message: Message, state: FSMContext):
+    data = await state.get_data()
+    test_id = data.get("editing_test_id")
+    new_title = message.text
+
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE tests SET title = ? WHERE id = ?", (new_title, test_id))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        await message.answer("❌ این عنوان قبلاً ثبت شده است. نام دیگری وارد کنید:")
+        return
+    conn.close()
+
+    await state.clear()
+    await message.answer("✅ نام آزمون با موفقیت ویرایش شد.")
+    await show_admin_panel(message)
 
 @dp.callback_query(F.data.startswith("edit_seg_"))
 async def edit_segment_options(callback: CallbackQuery, state: FSMContext):
@@ -448,7 +487,6 @@ async def action_edit_lang(callback: CallbackQuery, state: FSMContext):
     conn.close()
 
     await callback.answer(f"زبان سگمنت با موفقیت به {new_lang.upper()} تغییر یافت!", show_alert=True)
-    # بازگشت به منوی ویرایش همان سگمنت
     callback.data = f"edit_seg_{seg_id}"
     await edit_segment_options(callback, state)
 
@@ -466,7 +504,6 @@ async def action_delete_segment(callback: CallbackQuery, state: FSMContext):
     conn.close()
 
     await callback.answer("سگمنت با موفقیت حذف شد.", show_alert=True)
-    # بازگشت به لیست سگمنت‌های آزمون
     callback.data = f"manage_test_{test_id}"
     await manage_single_test(callback, state)
 
@@ -834,7 +871,7 @@ async def start_web_server():
 
 async def main():
     await start_web_server()
-    logging.info("Starting bot with ZIP upload and segment management features...")
+    logging.info("Starting bot with robust JSON parsing and test title editing...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
