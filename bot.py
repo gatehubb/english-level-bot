@@ -37,6 +37,8 @@ def init_db():
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY, failed_attempts INTEGER DEFAULT 0, is_blocked INTEGER DEFAULT 0)")
+    # جدول ذخیره کاربران برای ارسال نوتیفیکیشن همگانی
+    cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cursor.execute("CREATE TABLE IF NOT EXISTS tests (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT UNIQUE, test_type TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cursor.execute("CREATE TABLE IF NOT EXISTS segments (id INTEGER PRIMARY KEY AUTOINCREMENT, test_id INTEGER, file_id TEXT, answer_key TEXT, segment_index INTEGER, segment_lang TEXT, speaker_info TEXT, segment_tip TEXT, FOREIGN KEY(test_id) REFERENCES tests(id) ON DELETE CASCADE)")
     cursor.execute("CREATE TABLE IF NOT EXISTS results (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, test_title TEXT, analysis TEXT, date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
@@ -52,6 +54,7 @@ class AdminStates(StatesGroup):
     waiting_for_segment_audio = State()
     waiting_for_segment_tip = State()
     waiting_for_segment_key = State()
+    waiting_for_broadcast_message = State() # استیت جدید برای ارسال پیام همگانی
     editing_answer_key = State()
     editing_audio = State()
     editing_tip = State()
@@ -65,10 +68,17 @@ class UserTestStates(StatesGroup):
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     
+    user_id = message.from_user.id
+    username = message.from_user.username or ""
+    
+    # ذخیره خودکار کاربر در دیتابیس جهت ارسال نوتیفیکیشن‌های بعدی
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT is_blocked FROM admins WHERE user_id = ?", (message.from_user.id,))
+    cursor.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, username))
+    
+    cursor.execute("SELECT is_blocked FROM admins WHERE user_id = ?", (user_id,))
     admin_row = cursor.fetchone()
+    conn.commit()
     conn.close()
     
     if admin_row and admin_row[0] == 1:
@@ -223,10 +233,47 @@ async def show_admin_panel(message: Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="ساخت آزمون جدید (گام به گام)", callback_data="admin_create_manual")],
         [InlineKeyboardButton(text="✏️ مدیریت، ویرایش آزمون‌ها و سگمنت‌ها", callback_data="admin_manage_tests")],
+        [InlineKeyboardButton(text="📢 ارسال نوتیفیکیشن همگانی", callback_data="admin_broadcast")], # دکمه جدید نوتیفیکیشن
         [InlineKeyboardButton(text="مشاهده نتایج کاربران", callback_data="admin_view_results")],
         [InlineKeyboardButton(text="پاکسازی کل اطلاعات", callback_data="admin_clear_db")]
     ])
     await message.answer("پنل مدیریت پیشرفته\n\nلطفاً یکی از گزینه‌های زیر را انتخاب کنید:", reply_markup=keyboard)
+
+# شروع فرآیند ارسال نوتیفیکیشن همگانی
+@dp.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_broadcast_message)
+    await callback.message.answer("📢 لطفاً متن پیامی که می‌خواهید به عنوان نوتیفیکیشن یا آپدیت به تمامی کاربران ارسال شود را بفرستید:")
+    await callback.answer()
+
+# دریافت متن پیام و ارسال به همه کاربران
+@dp.message(AdminStates.waiting_for_broadcast_message, F.text)
+async def process_broadcast_message(message: Message, state: FSMContext):
+    broadcast_text = message.text
+    await state.clear()
+
+    status_msg = await message.answer("⏳ در حال ارسال نوتیفیکیشن به تمامی کاربران...")
+
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM users")
+    users = cursor.fetchall()
+    conn.close()
+
+    success_count = 0
+    fail_count = 0
+
+    for user in users:
+        u_id = user[0]
+        try:
+            await bot.send_message(chat_id=u_id, text=f"🔔 **اطلاعیه جدید / آپدیت ربات:**\n\n{broadcast_text}")
+            success_count += 1
+            await asyncio.sleep(0.05) # جلوگیری از ریت لیمیت تلگرام
+        except Exception:
+            fail_count += 1
+
+    await status_msg.edit_text(f"✅ ارسال نوتیفیکیشن همگانی به اتمام رسید!\n\n• ارسال موفق: {success_count}\n• ناموفق (کاربر ربات را بلاک کرده): {fail_count}")
+    await show_admin_panel(message)
 
 @dp.callback_query(F.data == "admin_create_manual")
 async def admin_create_manual(callback: CallbackQuery, state: FSMContext):
@@ -485,6 +532,7 @@ async def admin_clear_db(callback: CallbackQuery):
     cursor.execute("DELETE FROM results")
     cursor.execute("DELETE FROM segments")
     cursor.execute("DELETE FROM tests")
+    cursor.execute("DELETE FROM users")
     conn.commit()
     conn.close()
     await callback.message.answer("تمام اطلاعات پاک شد.")
