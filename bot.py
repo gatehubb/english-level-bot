@@ -39,8 +39,8 @@ def init_db():
     cursor.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY, failed_attempts INTEGER DEFAULT 0, is_blocked INTEGER DEFAULT 0)")
     cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cursor.execute("CREATE TABLE IF NOT EXISTS tests (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT UNIQUE, test_type TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-    # اضافه شدن ستون evaluation_guide به جدول segments برای راهنمای اختصاصی تصحیح
-    cursor.execute("CREATE TABLE IF NOT EXISTS segments (id INTEGER PRIMARY KEY AUTOINCREMENT, test_id INTEGER, file_id TEXT, answer_key TEXT, segment_index INTEGER, segment_lang TEXT, speaker_info TEXT, segment_tip TEXT, evaluation_guide TEXT, FOREIGN KEY(test_id) REFERENCES tests(id) ON DELETE CASCADE)")
+    # اضافه شدن ستون custom_ai_prompt به جدول segments برای ذخیره پرامپت اختصاصی تصحیح
+    cursor.execute("CREATE TABLE IF NOT EXISTS segments (id INTEGER PRIMARY KEY AUTOINCREMENT, test_id INTEGER, file_id TEXT, answer_key TEXT, segment_index INTEGER, segment_lang TEXT, speaker_info TEXT, segment_tip TEXT, evaluation_guide TEXT, custom_ai_prompt TEXT, FOREIGN KEY(test_id) REFERENCES tests(id) ON DELETE CASCADE)")
     cursor.execute("CREATE TABLE IF NOT EXISTS results (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, test_title TEXT, analysis TEXT, date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cursor.execute("CREATE TABLE IF NOT EXISTS user_completed_tests (user_id INTEGER, test_id INTEGER, PRIMARY KEY(user_id, test_id))")
     conn.commit()
@@ -55,12 +55,14 @@ class AdminStates(StatesGroup):
     waiting_for_segment_audio = State()
     waiting_for_segment_tip = State()
     waiting_for_segment_key = State()
-    waiting_for_evaluation_guide = State() # استیت جدید برای دریافت راهنمای تصحیح
+    waiting_for_evaluation_guide = State()
+    waiting_for_custom_ai_prompt = State() # استیت جدید برای دریافت پرامپت تصحیح هوش مصنوعی
     waiting_for_broadcast_message = State()
     editing_answer_key = State()
     editing_audio = State()
     editing_tip = State()
-    editing_guide = State() # استیت ویرایش راهنمای تصحیح
+    editing_guide = State()
+    editing_custom_prompt = State() # استیت ویرایش پرامپت هوش مصنوعی
     editing_test_title = State()
 
 class UserTestStates(StatesGroup):
@@ -142,8 +144,8 @@ async def user_start_test(callback: CallbackQuery, state: FSMContext):
     cursor.execute("SELECT title, test_type FROM tests WHERE id = ?", (test_id,))
     test_row = cursor.fetchone()
     
-    # واکشی اطلاعات شامل کلید پاسخ و راهنمای تصحیح اختصاصی
-    cursor.execute("SELECT id, file_id, answer_key, segment_lang, speaker_info, segment_tip, evaluation_guide FROM segments WHERE test_id = ? ORDER BY segment_index ASC", (test_id,))
+    # واکشی اطلاعات شامل پرامپت اختصاصی هوش مصنوعی
+    cursor.execute("SELECT id, file_id, answer_key, segment_lang, speaker_info, segment_tip, evaluation_guide, custom_ai_prompt FROM segments WHERE test_id = ? ORDER BY segment_index ASC", (test_id,))
     segments = cursor.fetchall()
     conn.close()
 
@@ -396,25 +398,32 @@ async def process_segment_tip(message: Message, state: FSMContext):
 @dp.message(AdminStates.waiting_for_segment_key, F.text)
 async def process_segment_key(message: Message, state: FSMContext):
     await state.update_data(answer_key=message.text)
-    await message.answer("متن راهنمای تصحیح و نحوه نمره‌دهی اختصاصی این سگمنت را وارد کنید (دستورالعمل چگونگی سنجش این سگمنت):")
+    await message.answer("متن راهنمای تصحیح و نحوه نمره‌دهی این سگمنت را وارد کنید:")
     await state.set_state(AdminStates.waiting_for_evaluation_guide)
 
 @dp.message(AdminStates.waiting_for_evaluation_guide, F.text)
 async def process_evaluation_guide(message: Message, state: FSMContext):
+    await state.update_data(evaluation_guide=message.text)
+    await message.answer("حالا **پرامپت اختصاصی تصحیح هوش مصنوعی** را برای این سگمنت وارد کنید (دستورالعملی که هوش مصنوعی برای ارزیابی و ساختار خروجی باید از آن پیروی کند):")
+    await state.set_state(AdminStates.waiting_for_custom_ai_prompt)
+
+@dp.message(AdminStates.waiting_for_custom_ai_prompt, F.text)
+async def process_custom_ai_prompt(message: Message, state: FSMContext):
     data = await state.get_data()
     test_id = data.get("test_id")
     file_id = data.get("file_id")
     segment_tip = data.get("segment_tip")
     answer_key = data.get("answer_key")
-    evaluation_guide = message.text
+    evaluation_guide = data.get("evaluation_guide")
+    custom_ai_prompt = message.text
     seg_index = data.get("segment_index")
     segment_lang = data.get("segment_lang")
 
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO segments (test_id, file_id, answer_key, segment_index, segment_lang, segment_tip, evaluation_guide) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (test_id, file_id, answer_key, seg_index, segment_lang, segment_tip, evaluation_guide)
+        "INSERT INTO segments (test_id, file_id, answer_key, segment_index, segment_lang, segment_tip, evaluation_guide, custom_ai_prompt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (test_id, file_id, answer_key, seg_index, segment_lang, segment_tip, evaluation_guide, custom_ai_prompt)
     )
     conn.commit()
     conn.close()
@@ -423,7 +432,7 @@ async def process_evaluation_guide(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="افزودن سگمنت بعدی", callback_data="admin_add_more_segment")],
         [InlineKeyboardButton(text="پایان بارگذاری", callback_data="admin_finish_test")]
     ])
-    await message.answer(f"سگمنت {seg_index} با راهنمای تصحیح ثبت شد.", reply_markup=keyboard)
+    await message.answer(f"سگمنت {seg_index} با موفقیت به همراه پرامپت اختصاصی هوش مصنوعی ثبت شد.", reply_markup=keyboard)
 
 @dp.callback_query(F.data == "admin_add_more_segment")
 async def admin_add_more_segment(callback: CallbackQuery, state: FSMContext):
@@ -480,15 +489,15 @@ async def edit_segment_options(callback: CallbackQuery, state: FSMContext):
     seg_id = int(callback.data.split("_")[2])
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT segment_index, answer_key, test_id, segment_tip, evaluation_guide FROM segments WHERE id = ?", (seg_id,))
-    index, answer_key, test_id, tip, guide = cursor.fetchone()
+    cursor.execute("SELECT segment_index, answer_key, test_id, segment_tip, evaluation_guide, custom_ai_prompt FROM segments WHERE id = ?", (seg_id,))
+    index, answer_key, test_id, tip, guide, custom_prompt = cursor.fetchone()
     conn.close()
     await state.update_data(editing_seg_id=seg_id, test_id=test_id)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗑 حذف سگمنت", callback_data=f"seg_action_del_{seg_id}")],
         [InlineKeyboardButton(text="🔙 بازگشت", callback_data=f"manage_test_{test_id}")]
     ])
-    await callback.message.edit_text(f"سگمنت {index}:\n\nراهنما: {tip}\n\nپاسخ: {answer_key}\n\nدستورالعمل تصحیح: {guide}", reply_markup=keyboard)
+    await callback.message.edit_text(f"سگمنت {index}:\n\nراهنما: {tip}\n\nپاسخ: {answer_key}\n\nدستورالعمل: {guide}\n\nپرامپت هوش مصنوعی: {custom_prompt}", reply_markup=keyboard)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("seg_action_del_"))
@@ -512,244 +521,4 @@ async def admin_back_to_main(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "admin_view_results")
 async def admin_view_results(callback: CallbackQuery):
-    conn = sqlite3.connect("bot_database.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT username, test_title, analysis, date FROM results ORDER BY id DESC LIMIT 5")
-    rows = cursor.fetchall()
-    conn.close()
-    if not rows:
-        await callback.message.edit_text("نتیجه‌ای نیست.")
-        return
-    text = "۵ تحلیل اخیر:\n\n"
-    for r in rows:
-        text += f"کاربر: {r[0]}\nآزمون: {r[1]}\n{r[2][:100]}...\n---\n"
-    await callback.message.edit_text(text)
-
-@dp.callback_query(F.data == "admin_clear_db")
-async def admin_clear_db(callback: CallbackQuery):
-    conn = sqlite3.connect("bot_database.db")
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM results")
-    cursor.execute("DELETE FROM segments")
-    cursor.execute("DELETE FROM tests")
-    cursor.execute("DELETE FROM users")
-    cursor.execute("DELETE FROM user_completed_tests")
-    conn.commit()
-    conn.close()
-    await callback.message.answer("پاکسازی شد.")
-    await callback.answer()
-
-@dp.message(UserTestStates.taking_test, F.voice)
-async def handle_user_voice_test(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    data = await state.get_data()
-    test_id = data.get("test_id")
-    test_title = data.get("test_title")
-    test_type = data.get("test_type")
-    segments = data.get("segments")
-    curr_idx = data.get("current_index")
-    session_results = data.get("session_results")
-    
-    audio_prompt_id = data.get("last_audio_prompt_id")
-    title_prompt_id = data.get("last_title_prompt_id")
-
-    try:
-        if audio_prompt_id:
-            await bot.delete_message(chat_id=message.chat.id, message_id=audio_prompt_id)
-        if title_prompt_id:
-            await bot.delete_message(chat_id=message.chat.id, message_id=title_prompt_id)
-        await message.delete()
-    except:
-        pass
-
-    seg_tuple = segments[curr_idx]
-    answer_key, segment_lang, evaluation_guide = seg_tuple[2], seg_tuple[3], seg_tuple[6]
-
-    status_msg = await message.answer(f"⏳ در حال پردازش سگمنت {curr_idx + 1}...")
-    file_path = f"voice_{user_id}.ogg"
-
-    try:
-        if not GEMINI_API_KEY:
-            await status_msg.edit_text("کلید GEMINI_API_KEY تنظیم نشده است.")
-            return
-
-        # پرامپت هوشمند مجهز به کلید پاسخ و دستورالعمل اختصاصی تصحیح ادمین
-        guide_instruction = f"\nدستورالعمل و راهنمای اختصاصی تصحیح برای این سگمنت:\n{evaluation_guide}" if evaluation_guide else ""
-
-        system_prompt = f"""
-تو یک سیستم ارزیابی حرفه‌ای آزمون ترجمه شفاهی NAATI CCL هستی.
-اگر صوت خالی، بی‌صدا یا دارای نویز شدید بود، با این عبارت شروع کن:
-`INVALID_AUDIO: [دلیل مختصر]`
-
-کلید مرجع (Answer Key):
-"{answer_key}"
-{guide_instruction}
-
-تو باید منحصراً و صرفاً با توجه به کلید مرجع و راهنمای تصحیح بالا ارزیابی را انجام دهی و از خودت ملاک‌های اضافی تراش نکنی.
-
-نوع آزمون: {test_type}
-شماره سگمنت: {curr_idx + 1}
-زبان فایل صوتی مرجع: {segment_lang}
-"""
-
-        if test_type == "placement":
-            system_prompt += """
-ارزیابی خود را انجام بده و خروجی را دقیقاً با این فرمت ارسال کن:
-نتیجه ارزیابی سگمنت 
-متن مرجع: [متن]
-ترجمه شما: [ترجمه]
-ارزیابی عملکرد (Assessment Criteria)
-دقت (Accuracy): [توضیح]
-کیفیت زبان (Language): [توضیح]
-کیفیت ارائه (Delivery): [توضیح]
-نمرات شما:
-- دقت (Accuracy): [عدد]%
-- زبان (Language): [عدد]%
-- ارائه (Delivery): [عدد]%
-- نمره کل (Overall): [عدد]%
-"""
-        else:
-            system_prompt += """
-خروجی را دقیقاً با این فرمت ارسال کن:
-نتیجه ارزیابی سگمنت {curr_idx + 1}
-متن مرجع: {answer_key}
-ترجمه شما: [ترجمه]
-ارزیابی عملکرد (Assessment Criteria)
-دقت (Accuracy): [توضیح]
-کیفیت زبان (Language): [توضیح]
-کیفیت ارائه (Delivery): [توضیح]
-نسخه درست و بهبود یافته: [نسخه]
-نمرات شما:
-- دقت (Accuracy): [عدد]%
-- زبان (Language): [عدد]%
-- ارائه (Delivery): [عدد]%
-- نمره کل (Overall): [عدد]%
-"""
-
-        ai_client = genai.Client(api_key=GEMINI_API_KEY)
-        file = await bot.get_file(message.voice.file_id)
-        await bot.download_file(file.file_path, file_path)
-        
-        audio_file = ai_client.files.upload(file=file_path)
-        
-        response = None
-        for attempt in range(3):
-            try:
-                response = ai_client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=[system_prompt, audio_file]
-                )
-                break
-            except Exception as api_err:
-                if attempt == 2:
-                    raise api_err
-                await asyncio.sleep(3)
-
-        analysis_result = response.text.strip()
-        ai_client.files.delete(name=audio_file.name)
-
-        if analysis_result.startswith("INVALID_AUDIO:"):
-            error_details = analysis_result.replace("INVALID_AUDIO:", "").strip()
-            await status_msg.edit_text(f"اخطار در بررسی فایل صوتی:\n\n{error_details}\n\nلطفاً همین سگمنت را دوباره ویس بفرستید.")
-            return
-
-        await status_msg.delete()
-        session_results.append(analysis_result)
-
-        next_idx = curr_idx + 1
-        if next_idx < len(segments):
-            await state.update_data(current_index=next_idx, session_results=session_results)
-            await show_segment_tip(message, state)
-        else:
-            conn = sqlite3.connect("bot_database.db")
-            cursor = conn.cursor()
-            cursor.execute("INSERT OR REPLACE INTO user_completed_tests (user_id, test_id) VALUES (?, ?)", (user_id, test_id))
-            conn.commit()
-            conn.close()
-
-            acc_list, lang_list, del_list, overall_list = [], [], [], []
-            for res in session_results:
-                acc_match = re.search(r"دقت\s*\(Accuracy\):\s*(\d+)%", res)
-                lang_match = re.search(r"زبان\s*\(Language\):\s*(\d+)%", res)
-                del_match = re.search(r"ارائه\s*\(Delivery\):\s*(\d+)%", res)
-                ov_match = re.search(r"نمره کل\s*\(Overall\):\s*(\d+)%", res)
-                
-                if acc_match: acc_list.append(int(acc_match.group(1)))
-                if lang_match: lang_list.append(int(lang_match.group(1)))
-                if del_match: del_list.append(int(del_match.group(1)))
-                if ov_match: overall_list.append(int(ov_match.group(1)))
-
-            avg_acc = sum(acc_list) // len(acc_list) if acc_list else 0
-            avg_lang = sum(lang_list) // len(lang_list) if lang_list else 0
-            avg_del = sum(del_list) // len(del_list) if del_list else 0
-            avg_overall = sum(overall_list) // len(overall_list) if overall_list else 0
-
-            if test_type == "placement":
-                readiness = avg_overall
-                status_text = "در مسیر پیشرفت" if readiness >= 60 else "نیاز به تلاش بیشتر"
-                
-                placement_report = f"""
-آزمون تعیین سطح سنجش آمادگی NAATI CCL 📋
-
-نتیجه کلی ارزیابی سطح شما 📊
-درصد آمادگی فعلی: {readiness}% 📈
-سطح: {status_text} 🎯
-
-۱. دقت (Accuracy): {avg_acc}% 🎯
-۲. زبان (Language): {avg_lang}% 🗣
-۳. ارائه (Delivery): {avg_del}% ⏱
-۴. نمره کل (Overall): {avg_overall}% 📝
-
-🔒 برای دریافت برنامه تمرینی، در کانال رسمی ما عضو شوید:
-"""
-                keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="عضویت در کانال", url=CHANNEL_LINK)],
-                    [InlineKeyboardButton(text="بررسی عضویت", callback_data="check_channel_membership")]
-                ])
-                await state.update_data(session_results=session_results)
-                await message.answer(placement_report, reply_markup=keyboard)
-            else:
-                full_report_text = f"کارنامه نهایی آزمون ماک: {test_title}\n\nدقت: {avg_acc}%\nزبان: {avg_lang}%\nارائه: {avg_del}%\nنمره کل: {avg_overall}%"
-                keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="مشاهده تحلیل جزئیات", callback_data="show_detailed_report")]
-                ])
-                await state.update_data(session_results=session_results)
-                await message.answer(full_report_text, reply_markup=keyboard)
-
-    except Exception as e:
-        await status_msg.edit_text(f"خطا در تحلیل:\n{str(e)}")
-    
-    finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-
-@dp.callback_query(F.data == "check_channel_membership")
-async def check_channel_membership(callback: CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    try:
-        member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
-        if member.status in ["member", "administrator", "creator"]:
-            await callback.message.answer("عضویت شما تأیید شد!")
-            await state.clear()
-        else:
-            await callback.answer("شما هنوز در کانال عضو نشده‌اید!", show_alert=True)
-    except Exception as e:
-        await callback.answer("خطا در بررسی عضویت.", show_alert=True)
-
-@dp.callback_query(F.data == "show_detailed_report")
-async def show_detailed_report(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    session_results = data.get("session_results", [])
-    for res in session_results:
-        await callback.message.answer(res)
-    await state.clear()
-    await callback.answer()
-
-async def main():
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logging.info("Flask web server started.")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    conn = sqlite3.connect("bot_database.db
