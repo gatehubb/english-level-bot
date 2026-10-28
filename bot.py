@@ -17,10 +17,8 @@ logging.basicConfig(level=logging.INFO)
 TELEGRAM_BOT_TOKEN = "8834529401:AAFEVB8Xyzob8PVkN-V2Qn0MfZ41NscWkAw"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 ADMIN_PASSWORD = "2377451"
-ADMIN_USER_ID = 518615926  # اینجا به جای این عدد، آیدی عددی تلگرام خودتان را قرار دهید اگر خواستید (یا از طریق گروه بررسی می‌شود)
-ADMIN_GROUP_ID = -4487871416  # آیدی عددی گروه خصوصی Mock test شما (باید جایگزین شود)
-CHANNEL_USERNAME = "@hesammock"
-CHANNEL_LINK = "https://t.me/hesammock"
+CHANNEL_USERNAME = "@YourChannelUsername"
+CHANNEL_LINK = "https://t.me/YourChannelUsername"
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -130,7 +128,7 @@ async def user_start_test(callback: CallbackQuery, state: FSMContext):
         test_type=test_type,
         segments=segments,
         current_index=0,
-        user_voices=[] # ذخیره موقت ویس‌های کاربر
+        user_voices=[]
     )
 
     await show_segment_tip(callback.message, state)
@@ -150,7 +148,7 @@ async def show_segment_tip(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="✅ بله، متوجه شدم و آماده‌ام", callback_data="ack_tip_and_play")]
     ])
     
-    await message.answer(f"💡 **راهنمای سگمنت {curr_idx + 1} از لغو {len(segments)}:**\n\n{tip_text}", reply_markup=keyboard)
+    await message.answer(f"💡 **راهنمای سگمنت {curr_idx + 1} از {len(segments)}:**\n\n{tip_text}", reply_markup=keyboard)
 
 @dp.callback_query(UserTestStates.waiting_for_tip_ack, F.data == "ack_tip_and_play")
 async def ack_tip_and_play(callback: CallbackQuery, state: FSMContext):
@@ -176,9 +174,10 @@ async def ack_tip_and_play(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(F.text == "/admin")
 async def cmd_admin(message: Message, state: FSMContext):
+    user_id = message.from_user.id
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT is_blocked FROM admins WHERE user_id = ?", (message.from_user.id,))
+    cursor.execute("SELECT is_blocked FROM admins WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
     
     if row and row[0] == 1:
@@ -186,7 +185,7 @@ async def cmd_admin(message: Message, state: FSMContext):
         await message.answer("❌ دسترسی شما مسدود شده است.")
         return
         
-    cursor.execute("SELECT 1 FROM admins WHERE user_id = ? AND is_blocked = 0", (message.from_user.id,))
+    cursor.execute("SELECT 1 FROM admins WHERE user_id = ? AND is_blocked = 0", (user_id,))
     is_admin = cursor.fetchone()
     conn.close()
 
@@ -207,6 +206,7 @@ async def process_admin_password(message: Message, state: FSMContext):
     failed = row[0] if row else 0
 
     if message.text == ADMIN_PASSWORD:
+        # ثبت خودکار کاربر به عنوان ادمین در دیتابیس
         cursor.execute("INSERT OR REPLACE INTO admins (user_id, failed_attempts, is_blocked) VALUES (?, 0, 0)", (user_id,))
         conn.commit()
         conn.close()
@@ -382,7 +382,8 @@ async def admin_manage_tests(callback: CallbackQuery, state: FSMContext):
         await show_admin_panel(callback.message)
         await callback.answer()
         return
-    buttons = [[InlineKeyboardButton(text=f"📂 {t[1]} ({t[2])}", callback_data=f"manage_test_{t[0]}")] for t in tests]
+    # اصلاح خطای پرانتز آکولاد در این بخش
+    buttons = [[InlineKeyboardButton(text=f"📂 {t[1]} ({t[2]})", callback_data=f"manage_test_{t[0]}")] for t in tests]
     buttons.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin_back_to_main")])
     await callback.message.edit_text("آزمون را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await callback.answer()
@@ -452,7 +453,6 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
     curr_idx = data.get("current_index")
     user_voices = data.get("user_voices", [])
 
-    # ذخیره فایل آیدی ویس این سگمنت
     user_voices.append({
         "segment_index": curr_idx + 1,
         "voice_file_id": message.voice.file_id
@@ -463,7 +463,6 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
         await state.update_data(current_index=next_idx, user_voices=user_voices)
         await show_segment_tip(message, state)
     else:
-        # اتمام آزمون! حالا پردازش نهایی و ارسال به گروه ادمین
         status_msg = await message.answer("⏳ آزمون شما به پایان رسید. در حال پردازش هوش مصنوعی و ارسال برای بررسی ادمین...")
         
         test_title = data.get("test_title")
@@ -510,7 +509,6 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
                 if os.path.exists(file_path):
                     os.remove(file_path)
 
-        # محاسبه میانگین نمرات
         acc_list, lang_list, del_list, overall_list = [], [], [], []
         for res in session_results:
             acc_match = re.search(r"دقت\s*\(Accuracy\):\s*(\d+)%", res)
@@ -528,16 +526,15 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
         avg_del = sum(del_list) // len(del_list) if del_list else 0
         avg_overall = sum(overall_list) // len(overall_list) if overall_list else 0
 
-        # متن مشاوره
         if test_type == "placement":
             if avg_overall < 50:
-                advice = "تفسیر: با توجه به نمرات، پیشنهاد نمی‌شود به آزمون بروید و نیاز به تلاش بیشتری دارید."
+                advice = "تفسیر و مشاوره: با توجه به نمرات کسب‌شده، هزینه‌های آزمون و آپدیت‌های جدید که نشان می‌دهد مصحح‌ها سخت‌گیری بیشتری دارند، اصلاً به شما پیشنهاد نمی‌کنیم که در این مقطع به سراغ آزمون اصلی بروید. شما نیاز به تمرین بیشتری دارید."
             elif avg_overall < 75:
-                advice = "تفسیر: نیاز به رفع اشکال توسط استاد دارید."
+                advice = "تفسیر و مشاوره: با توجه به نمرات به دست آمده، عملکرد شما نیاز به رفع اشکال دقیق‌تر توسط یک استاد دارد و توصیه می‌شود با سرعت به سراغ آزمون اصلی نروید."
             else:
-                advice = "تفسیر: عملکرد خوب؛ با کمی تمرین آماده آزمون هستید."
+                advice = "تفسیر و مشاوره: عملکرد شما عالی بود! با توجه به این نمرات، می‌توانید با کمی تمرینِ هدفمند به سراغ آزمون اصلی بروید؛ با این حال، پیشنهاد می‌کنیم حتماً از راهنمایی‌های یک استاد هم بهره‌مند شوید."
         else:
-            advice = "ارزیابی آزمون ماک کامل."
+            advice = "ارزیابی آزمون ماک کامل انجام شد."
 
         report_summary = f"""
 📋 **درخواست بررسی کارنامه جدید**
@@ -545,48 +542,51 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
 📚 آزمون: {test_title} ({test_type})
 
 📊 **میانگین نمرات:**
-• دقت: {avg_acc}%
-• زبان: {avg_lang}%
-• ارائه: {avg_del}%
-• نمره کل: {avg_overall}%
+• دقت (Accuracy): {avg_acc}%
+• زبان (Language): {avg_lang}%
+• ارائه (Delivery): {avg_del}%
+• نمره کل (Overall): {avg_overall}%
 
 {advice}
 """
 
-        # ارسال به گروه ادمین برای تایید
+        # ارسال مستقیم به پی‌وی تمام ادمین‌های ثبت‌شده در دیتابیس
+        conn = sqlite3.connect("bot_database.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM admins WHERE is_blocked = 0")
+        active_admins = cursor.fetchall()
+        conn.close()
+
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ تایید و ارسال به کاربر", callback_data=f"approve_{user_id}")],
             [InlineKeyboardButton(text="❌ رد کردن", callback_data=f"reject_{user_id}")]
         ])
 
-        # ذخیره موقت گزارش در استیت یا دیتابیس موقت برای استفاده ادمین
-        await state.update_data(final_report=report_summary, pending_user_id=user_id)
+        for admin in active_admins:
+            admin_id = admin[0]
+            try:
+                await bot.send_message(chat_id=admin_id, text=report_summary, reply_markup=keyboard)
+                for item in user_voices:
+                    await bot.send_voice(chat_id=admin_id, voice=item["voice_file_id"], caption=f"ویس سگمنت {item['segment_index']} - کاربر @{username}")
+            except Exception as err:
+                logging.error(f"Failed to send report to admin {admin_id}: {err}")
 
-        try:
-            await bot.send_message(chat_id=ADMIN_GROUP_ID, text=report_summary, reply_markup=keyboard)
-            # ارسال ویس‌های کاربر هم به گروه ادمین
-            for item in user_voices:
-                await bot.send_voice(chat_id=ADMIN_GROUP_ID, voice=item["voice_file_id"], caption=f"ویس سگمنت {item['segment_index']} - کاربر @{username}")
-        except Exception as err:
-            await message.answer(f"⚠️ خطا در ارسال به گروه ادمین: {err}")
-
-        await status_msg.edit_text("✅ آزمون شما با موفقیت به پایان رسید و کارنامه شما برای بررسی و تایید نهایی به استاد/ادمین ارسال شد. به زودی نتیجه به دستتان می‌رسد.")
+        await status_msg.edit_text("✅ آزمون شما به پایان رسید و کارنامه شما برای بررسی و تایید نهایی به ادمین ارسال شد. به زودی نتیجه به دستتان می‌رسد.")
         await state.clear()
 
-# دکمه تایید ادمین در گروه
 @dp.callback_query(F.data.startswith("approve_"))
 async def admin_approve_report(callback: CallbackQuery, state: FSMContext):
     target_user_id = int(callback.data.split("_")[1])
-    data = await state.get_data()
-    report = data.get("final_report", "کارنامه شما تایید شد.")
-
+    
+    # استخراج متن کارنامه از پیام ارسالی به ادمین
+    report = callback.message.text.replace("📋 درخواست بررسی کارنامه جدید", "📋 **کارنامه نهایی آزمون شما**")
+    
     try:
         await bot.send_message(chat_id=target_user_id, text=f"🎉 **کارنامه و نتیجه آزمون شما توسط ادمین تایید و ارسال شد:**\n\n{report}")
-        if data.get("test_type") == "placement":
-            await bot.send_message(chat_id=target_user_id, text="🔒 برای دریافت برنامه تمرینی در کانال ما عضو شوید:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="عضویت در کانال", url=CHANNEL_LINK)],
-                [InlineKeyboardButton(text="بررسی عضویت", callback_data="check_channel_membership")]
-            ]))
+        await bot.send_message(chat_id=target_user_id, text="🔒 برای دریافت برنامه تمرینی و متریال‌های آموزشی، لطفاً در کانال رسمی ما عضو شوید:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="عضویت در کانال", url=CHANNEL_LINK)],
+            [InlineKeyboardButton(text="بررسی عضویت", callback_data="check_channel_membership")]
+        ]))
         await callback.message.edit_text(callback.message.text + "\n\n✅ **وضعیت: تایید و ارسال شد به کاربر**")
     except Exception as e:
         await callback.answer(f"خطا در ارسال به کاربر: {e}", show_alert=True)
