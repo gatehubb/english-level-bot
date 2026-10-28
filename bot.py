@@ -271,20 +271,14 @@ async def process_zip_test_type(callback: CallbackQuery, state: FSMContext):
 
         for root, dirs, files in os.walk(extract_dir):
             for file in files:
-                if (file.endswith(('.txt', '.json', '.log')) or 'script' in file.lower() or 'dialogue' in file.lower()) and not txt_file_path:
-                    if not file.endswith(('.mp3', '.ogg', '.wav', '.zip')):
-                        txt_file_path = os.path.join(root, file)
-                elif file.endswith(('.mp3', '.ogg', '.wav')):
+                # پذیرش هر فایلی که صوتی یا زیپ نباشد به عنوان فایل اسکریپت
+                if not file.lower().endswith(('.mp3', '.ogg', '.wav', '.zip', '.png', '.jpg', '.jpeg')) and not txt_file_path:
+                    txt_file_path = os.path.join(root, file)
+                elif file.lower().endswith(('.mp3', '.ogg', '.wav')):
                     audio_files_map[file] = os.path.join(root, file)
 
         if not txt_file_path:
-            for root, dirs, files in os.walk(extract_dir):
-                for file in files:
-                    if not file.endswith(('.mp3', '.ogg', '.wav', '.zip', '.png', '.jpg')) and not txt_file_path:
-                        txt_file_path = os.path.join(root, file)
-
-        if not txt_file_path:
-            await status_msg.edit_text("❌ فایل متنی یا اسکریپت داخل فایل زیپ پیدا نشد.")
+            await status_msg.edit_text("❌ هیچ فایل اسکریپتی داخل فایل زیپ پیدا نشد.")
             shutil.rmtree(extract_dir)
             await state.clear()
             return
