@@ -380,7 +380,8 @@ async def process_zip_test_type(callback: CallbackQuery, state: FSMContext):
         await status_msg.edit_text(f"❌ خطا در پردازش فایل زیپ:\n{str(e)}")
         await state.clear()
     await callback.answer()
-    @dp.callback_query(F.data == "admin_manage_tests")
+
+@dp.callback_query(F.data == "admin_manage_tests")
 async def admin_manage_tests(callback: CallbackQuery, state: FSMContext):
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
