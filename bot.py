@@ -37,11 +37,12 @@ def init_db():
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY, failed_attempts INTEGER DEFAULT 0, is_blocked INTEGER DEFAULT 0)")
-    # جدول ذخیره کاربران برای ارسال نوتیفیکیشن همگانی
     cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cursor.execute("CREATE TABLE IF NOT EXISTS tests (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT UNIQUE, test_type TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cursor.execute("CREATE TABLE IF NOT EXISTS segments (id INTEGER PRIMARY KEY AUTOINCREMENT, test_id INTEGER, file_id TEXT, answer_key TEXT, segment_index INTEGER, segment_lang TEXT, speaker_info TEXT, segment_tip TEXT, FOREIGN KEY(test_id) REFERENCES tests(id) ON DELETE CASCADE)")
     cursor.execute("CREATE TABLE IF NOT EXISTS results (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, test_title TEXT, analysis TEXT, date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    # جدول جدید برای ثبت آزمون‌هایی که کاربر داده است
+    cursor.execute("CREATE TABLE IF NOT EXISTS user_completed_tests (user_id INTEGER, test_id INTEGER, PRIMARY KEY(user_id, test_id))")
     conn.commit()
     conn.close()
 
@@ -54,7 +55,7 @@ class AdminStates(StatesGroup):
     waiting_for_segment_audio = State()
     waiting_for_segment_tip = State()
     waiting_for_segment_key = State()
-    waiting_for_broadcast_message = State() # استیت جدید برای ارسال پیام همگانی
+    waiting_for_broadcast_message = State()
     editing_answer_key = State()
     editing_audio = State()
     editing_tip = State()
@@ -71,7 +72,6 @@ async def cmd_start(message: Message, state: FSMContext):
     user_id = message.from_user.id
     username = message.from_user.username or ""
     
-    # ذخیره خودکار کاربر در دیتابیس جهت ارسال نوتیفیکیشن‌های بعدی
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     cursor.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, username))
@@ -85,30 +85,64 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer("❌ دسترسی شما به دلیل ورود ناموفق متوالی به پنل مدیریت مسدود شده است.")
         return
 
+    await show_available_tests(message)
+
+async def show_available_tests(message_or_callback):
+    user_id = message_or_callback.from_user.id
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     cursor.execute("SELECT id, title, test_type FROM tests")
     tests = cursor.fetchall()
+    
+    # گرفتن لیست آزمون‌هایی که کاربر قبلا داده است
+    cursor.execute("SELECT test_id FROM user_completed_tests WHERE user_id = ?", (user_id,))
+    completed_tests = [row[0] for row in cursor.fetchall()]
     conn.close()
 
     if not tests:
-        await message.answer("سلام! به ربات تعیین سطح و آزمون‌های ماک خوش آمدید.\n\nدر حال حاضر هیچ آزمونی فعال نشده است.")
+        text = "سلام! به ربات تعیین سطح و آزمون‌های ماک خوش آمدید.\n\nدر حال حاضر هیچ آزمونی فعال نشده است."
+        if isinstance(message_or_callback, CallbackQuery):
+            await message_or_callback.message.edit_text(text)
+        else:
+            await message_or_callback.answer(text)
         return
 
     keyboard_buttons = []
     for t_id, t_title, t_type in tests:
-        type_label = "🎯 تعیین سطح" if t_type == "placement" else "📝 ماک کامل"
+        if t_id in completed_tests:
+            type_label = "✅ (انجام شده) 🎯 تعیین سطح" if t_type == "placement" else "✅ (انجام شده) 📝 ماک کامل"
+        else:
+            type_label = "🎯 تعیین سطح" if t_type == "placement" else "📝 ماک کامل"
+            
         keyboard_buttons.append([InlineKeyboardButton(text=f"{type_label}: {t_title}", callback_data=f"start_test_{t_id}")])
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-    await message.answer("سلام! به بخش آزمون‌های ترجمه شفاهی خوش آمدید.\n\nلطفاً یکی از آزمون‌های زیر را انتخاب کنید:", reply_markup=keyboard)
+    text = "سلام! به بخش آزمون‌های ترجمه شفاهی خوش آمدید.\n\nلطفاً یکی از آزمون‌های زیر را انتخاب کنید:"
+    
+    if isinstance(message_or_callback, CallbackQuery):
+        await message_or_callback.message.edit_text(text, reply_markup=keyboard)
+    else:
+        await message_or_callback.answer(text, reply_markup=keyboard)
 
 @dp.callback_query(F.data.startswith("start_test_"))
 async def user_start_test(callback: CallbackQuery, state: FSMContext):
     test_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
     
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
+    
+    # بررسی اینکه آیا کاربر قبلا این آزمون را داده است یا خیر
+    cursor.execute("SELECT 1 FROM user_completed_tests WHERE user_id = ? AND test_id = ?", (user_id, test_id))
+    is_completed = cursor.fetchone()
+    
+    if is_completed:
+        conn.close()
+        await callback.answer("این آزمون را قبلاً انجام داده‌اید!", show_alert=True)
+        await callback.message.answer("⚠️ این آزمون تعیین سطح قبلاً توسط شما انجام شده و دوباره انجام دادن آن به هیچ وجه به شما کمک نمی‌کند. لطفاً به سراغ آزمون‌های دیگر بروید:")
+        await show_available_tests(callback)
+        return
+
     cursor.execute("SELECT title, test_type FROM tests WHERE id = ?", (test_id,))
     test_row = cursor.fetchone()
     
@@ -150,7 +184,8 @@ async def show_segment_tip(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="✅ بله، متوجه شدم و آماده‌ام", callback_data="ack_tip_and_play")]
     ])
     
-    await message.answer(f"💡 **راهنمای سگمنت {curr_idx + 1} از {len(segments)}:**\n\n{tip_text}", reply_markup=keyboard)
+    msg = await message.answer(f"💡 **راهنمای سگمنت {curr_idx + 1} از چهارتای/کل ({len(segments)}):**\n\n{tip_text}", reply_markup=keyboard)
+    await state.update_data(last_tip_msg_id=msg.message_id)
 
 @dp.callback_query(UserTestStates.waiting_for_tip_ack, F.data == "ack_tip_and_play")
 async def ack_tip_and_play(callback: CallbackQuery, state: FSMContext):
@@ -160,18 +195,26 @@ async def ack_tip_and_play(callback: CallbackQuery, state: FSMContext):
     curr_idx = data.get("current_index")
     seg = segments[curr_idx]
     
+    # پاک کردن پیام راهنما قبلی
+    try:
+        await callback.message.delete()
+    except:
+        pass
+
     lang_dir = "انگلیسی به فارسی 🇬🇧 ➡️ 🇮🇷" if seg[3] == "en" else "فارسی به انگلیسی 🇮🇷 ➡️ 🇬🇧"
     
-    await callback.message.answer(f"🎧 **سگمنت {curr_idx + 1}** ({lang_dir})\nگوينده: {seg[4] if seg[4] else 'گوینده اصلی'}\n\nبه فایل صوتی زیر گوش دهید و ترجمه خود را به صورت ویس ارسال کنید:")
+    audio_msg = await callback.message.answer(f"🎧 **سگمنت {curr_idx + 1}** ({lang_dir})\nگوينده: {seg[4] if seg[4] else 'گوینده اصلی'}\n\nبه فایل صوتی زیر گوش دهید و ترجمه خود را به صورت ویس ارسال کنید:")
     
     try:
-        await callback.message.answer_voice(voice=seg[1])
+        sent_voice_msg = await callback.message.answer_voice(voice=seg[1])
     except:
         try:
-            await callback.message.answer_audio(audio=seg[1])
+            sent_voice_msg = await callback.message.answer_audio(audio=seg[1])
         except:
-            await callback.message.answer_document(document=seg[1])
+            sent_voice_msg = await callback.message.answer_document(document=seg[1])
             
+    # ذخیره آی‌دی پیام‌های صوتی و متنی جهت حذف بعدی
+    await state.update_data(last_audio_prompt_id=sent_voice_msg.message_id, last_title_prompt_id=audio_msg.message_id)
     await callback.answer()
 
 @dp.message(F.text == "/admin")
@@ -233,27 +276,53 @@ async def show_admin_panel(message: Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="ساخت آزمون جدید (گام به گام)", callback_data="admin_create_manual")],
         [InlineKeyboardButton(text="✏️ مدیریت، ویرایش آزمون‌ها و سگمنت‌ها", callback_data="admin_manage_tests")],
-        [InlineKeyboardButton(text="📢 ارسال نوتیفیکیشن همگانی", callback_data="admin_broadcast")], # دکمه جدید نوتیفیکیشن
+        [InlineKeyboardButton(text="🔓 باز کردن دسترسی آزمون کاربر", callback_data="admin_reset_user_test")], # دکمه ریست دسترسی کاربر
+        [InlineKeyboardButton(text="📢 ارسال نوتیفیکیشن همگانی", callback_data="admin_broadcast")],
         [InlineKeyboardButton(text="مشاهده نتایج کاربران", callback_data="admin_view_results")],
         [InlineKeyboardButton(text="پاکسازی کل اطلاعات", callback_data="admin_clear_db")]
     ])
     await message.answer("پنل مدیریت پیشرفته\n\nلطفاً یکی از گزینه‌های زیر را انتخاب کنید:", reply_markup=keyboard)
 
-# شروع فرآیند ارسال نوتیفیکیشن همگانی
+# مدیریت ریست کردن دسترسی کاربر
+class AdminResetStates(StatesGroup):
+    waiting_for_user_id = State()
+
+@dp.callback_query(F.data == "admin_reset_user_test")
+async def admin_reset_user_test(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminResetStates.waiting_for_user_id)
+    await callback.message.answer("لطفاً شناسه تلگرامی (User ID) کاربر مورد نظر را بفرستید تا دسترسی آزمون‌های انجام‌شده برایش پاک شود:")
+    await callback.answer()
+
+@dp.message(AdminResetStates.waiting_for_user_id, F.text)
+async def process_reset_user(message: Message, state: FSMContext):
+    try:
+        target_user_id = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ شناسه باید فقط عدد باشد. دوباره تلاش کنید یا /admin را بزنید.")
+        return
+
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM user_completed_tests WHERE user_id = ?", (target_user_id,))
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+    await message.answer(f"✅ دسترسی آزمون‌ها برای کاربر با شناسه `{target_user_id}` با موفقیت بازنشانی (ریست) شد و اکنون می‌تواند دوباره آزمون بدهد.")
+    await show_admin_panel(message)
+
 @dp.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_broadcast_message)
-    await callback.message.answer("📢 لطفاً متن پیامی که می‌خواهید به عنوان نوتیفیکیشن یا آپدیت به تمامی کاربران ارسال شود را بفرستید:")
+    await callback.message.answer("📢 لطفاً متن پیام خود را ارسال کنید:")
     await callback.answer()
 
-# دریافت متن پیام و ارسال به همه کاربران
 @dp.message(AdminStates.waiting_for_broadcast_message, F.text)
 async def process_broadcast_message(message: Message, state: FSMContext):
     broadcast_text = message.text
     await state.clear()
-
-    status_msg = await message.answer("⏳ در حال ارسال نوتیفیکیشن به تمامی کاربران...")
-
+    status_msg = await message.answer("⏳ در حال ارسال...")
+    
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM users")
@@ -261,18 +330,15 @@ async def process_broadcast_message(message: Message, state: FSMContext):
     conn.close()
 
     success_count = 0
-    fail_count = 0
-
     for user in users:
-        u_id = user[0]
         try:
-            await bot.send_message(chat_id=u_id, text=f"🔔 **اطلاعیه جدید / آپدیت ربات:**\n\n{broadcast_text}")
+            await bot.send_message(chat_id=user[0], text=f"🔔 **اطلاعیه جدید:**\n\n{broadcast_text}")
             success_count += 1
-            await asyncio.sleep(0.05) # جلوگیری از ریت لیمیت تلگرام
-        except Exception:
-            fail_count += 1
+            await asyncio.sleep(0.04)
+        except:
+            pass
 
-    await status_msg.edit_text(f"✅ ارسال نوتیفیکیشن همگانی به اتمام رسید!\n\n• ارسال موفق: {success_count}\n• ناموفق (کاربر ربات را بلاک کرده): {fail_count}")
+    await status_msg.edit_text(f"✅ ارسال به {success_count} کاربر انجام شد.")
     await show_admin_panel(message)
 
 @dp.callback_query(F.data == "admin_create_manual")
@@ -305,23 +371,21 @@ async def process_test_title(message: Message, state: FSMContext):
         test_id = cursor.lastrowid
     except sqlite3.IntegrityError:
         conn.close()
-        await message.answer("این عنوان قبلاً ثبت شده است. نام دیگری وارد کنید:")
+        await message.answer("این عنوان تکراری است. نام دیگری وارد کنید:")
         return
     conn.close()
 
     await state.update_data(test_id=test_id)
-    
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="انگلیسی 🇬🇧", callback_data="lang_en"), InlineKeyboardButton(text="فارسی 🇮🇷", callback_data="lang_fa")]
     ])
-    await message.answer(f"آزمون «{title}» ایجاد شد.\n\nزبان سگمنت شماره {seg_index} را انتخاب کنید:", reply_markup=keyboard)
+    await message.answer(f"آزمون «{title}» ایجاد شد.\n\nزبان سگمنت ۱ را انتخاب کنید:", reply_markup=keyboard)
 
 @dp.callback_query(F.data.startswith("lang_"))
 async def process_segment_lang(callback: CallbackQuery, state: FSMContext):
     lang = callback.data.split("_")[1]
     await state.update_data(segment_lang=lang)
-    lang_name = "انگلیسی 🇬🇧" if lang == "en" else "فارسی 🇮🇷"
-    await callback.message.answer(f"زبان انتخاب شده: {lang_name}\n\nحالا فایل صوتی این سگمنت را ارسال کنید:")
+    await callback.message.answer("حالا فایل صوتی این سگمنت را ارسال کنید:")
     await state.set_state(AdminStates.waiting_for_segment_audio)
     await callback.answer()
 
@@ -329,13 +393,13 @@ async def process_segment_lang(callback: CallbackQuery, state: FSMContext):
 async def process_segment_audio(message: Message, state: FSMContext):
     file_id = message.voice.file_id if message.voice else (message.audio.file_id if message.audio else message.document.file_id)
     await state.update_data(file_id=file_id)
-    await message.answer("متن راهنما و توصیه‌های این سگمنت را وارد کنید (به کاربر قبل از پخش صوت نمایش داده می‌شود):")
+    await message.answer("متن راهنما (Tip) این سگمنت را وارد کنید:")
     await state.set_state(AdminStates.waiting_for_segment_tip)
 
 @dp.message(AdminStates.waiting_for_segment_tip, F.text)
 async def process_segment_tip(message: Message, state: FSMContext):
     await state.update_data(segment_tip=message.text)
-    await message.answer("متن کلید/پاسخ (Answer Key) این سگمنت را وارد کنید:")
+    await message.answer("متن پاسخ (Answer Key) این سگمنت را وارد کنید:")
     await state.set_state(AdminStates.waiting_for_segment_key)
 
 @dp.message(AdminStates.waiting_for_segment_key, F.text)
@@ -358,24 +422,23 @@ async def process_segment_key(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="افزودن سگمنت بعدی", callback_data="admin_add_more_segment")],
         [InlineKeyboardButton(text="پایان بارگذاری", callback_data="admin_finish_test")]
     ])
-    await message.answer(f"سگمنت شماره {seg_index} ثبت شد. مایلید چه کاری انجام دهید؟", reply_markup=keyboard)
+    await message.answer(f"سگمنت {seg_index} ثبت شد.", reply_markup=keyboard)
 
 @dp.callback_query(F.data == "admin_add_more_segment")
 async def admin_add_more_segment(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     new_index = data.get("segment_index") + 1
     await state.update_data(segment_index=new_index)
-    
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="انگلیسی 🇬🇧", callback_data="lang_en"), InlineKeyboardButton(text="فارسی 🇮🇷", callback_data="lang_fa")]
     ])
-    await callback.message.answer(f"زبان سگمنت شماره {new_index} را انتخاب کنید:", reply_markup=keyboard)
+    await callback.message.answer(f"زبان سگمنت {new_index} را انتخاب کنید:", reply_markup=keyboard)
     await callback.answer()
 
 @dp.callback_query(F.data == "admin_finish_test")
 async def admin_finish_test(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text("بارگذاری آزمون با موفقیت به اتمام رسید!")
+    await callback.message.edit_text("بارگذاری آزمون به اتمام رسید!")
     await show_admin_panel(callback.message)
     await callback.answer()
 
@@ -386,110 +449,46 @@ async def admin_manage_tests(callback: CallbackQuery, state: FSMContext):
     cursor.execute("SELECT id, title, test_type FROM tests")
     tests = cursor.fetchall()
     conn.close()
-
     if not tests:
-        await callback.message.edit_text("هیچ آزمونی برای مدیریت وجود ندارد.")
+        await callback.message.edit_text("هیچ آزمونی وجود ندارد.")
         await show_admin_panel(callback.message)
         await callback.answer()
         return
-
-    buttons = []
-    for t_id, t_title, t_type in tests:
-        buttons.append([InlineKeyboardButton(text=f"📂 {t_title} ({t_type})", callback_data=f"manage_test_{t_id}")])
-    
-    buttons.append([InlineKeyboardButton(text="🔙 بازگشت به پنل", callback_data="admin_back_to_main")])
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await callback.message.edit_text("لطفاً آزمون مورد نظر جهت ویرایش را انتخاب کنید:", reply_markup=keyboard)
+    buttons = [[InlineKeyboardButton(text=f"📂 {t[1]} ({t[2]})", callback_data=f"manage_test_{t[0]}")] for t in tests]
+    buttons.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin_back_to_main")])
+    await callback.message.edit_text("آزمون را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("manage_test_"))
 async def manage_single_test(callback: CallbackQuery, state: FSMContext):
     test_id = int(callback.data.split("_")[2])
-    
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     cursor.execute("SELECT title, test_type FROM tests WHERE id = ?", (test_id,))
-    test_title, test_type = cursor.fetchone()
-
-    cursor.execute("SELECT id, segment_index, segment_lang, answer_key FROM segments WHERE test_id = ? ORDER BY segment_index ASC", (test_id,))
-    segments = cursor.fetchall()
+    t_title, t_type = cursor.fetchone()
+    cursor.execute("SELECT id, segment_index, segment_lang FROM segments WHERE test_id = ? ORDER BY segment_index ASC", (test_id,))
+    segs = cursor.fetchall()
     conn.close()
-
-    buttons = [
-        [InlineKeyboardButton(text="✏️ ویرایش نام آزمون", callback_data=f"edit_test_title_{test_id}")]
-    ]
-    for seg_id, index, lang, key in segments:
-        buttons.append([InlineKeyboardButton(text=f"سگمنت {index} ({lang})", callback_data=f"edit_seg_{seg_id}")])
-
+    buttons = [[InlineKeyboardButton(text=f"سگمنت {s[1]} ({s[2]})", callback_data=f"edit_seg_{s[0]}")] for s in segs]
     buttons.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin_manage_tests")])
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    
-    await callback.message.edit_text(f"مدیریت آزمون: **{test_title}** ({test_type})\n\nسگمنت مورد نظر را انتخاب کنید:", reply_markup=keyboard)
+    await callback.message.edit_text(f"مدیریت آزمون {t_title}:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("edit_seg_"))
 async def edit_segment_options(callback: CallbackQuery, state: FSMContext):
     seg_id = int(callback.data.split("_")[2])
-    
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT segment_index, segment_lang, answer_key, test_id, segment_tip FROM segments WHERE id = ?", (seg_id,))
-    seg = cursor.fetchone()
+    cursor.execute("SELECT segment_index, answer_key, test_id, segment_tip FROM segments WHERE id = ?", (seg_id,))
+    index, answer_key, test_id, tip = cursor.fetchone()
     conn.close()
-
-    index, lang, answer_key, test_id, tip = seg
     await state.update_data(editing_seg_id=seg_id, test_id=test_id)
-
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ ویرایش متن پاسخ", callback_data=f"seg_action_key_{seg_id}")],
-        [InlineKeyboardButton(text="💡 ویرایش متن راهنما (Tip)", callback_data=f"seg_action_tip_{seg_id}")],
         [InlineKeyboardButton(text="🗑 حذف سگمنت", callback_data=f"seg_action_del_{seg_id}")],
         [InlineKeyboardButton(text="🔙 بازگشت", callback_data=f"manage_test_{test_id}")]
     ])
-
-    await callback.message.edit_text(
-        f"مدیریت سگمنت {index}:\n\n**راهنما:** {tip}\n\n**پاسخ:** {answer_key}",
-        reply_markup=keyboard
-    )
+    await callback.message.edit_text(f"سگمنت {index}:\nراهنما: {tip}\nپاسخ: {answer_key}", reply_markup=keyboard)
     await callback.answer()
-
-@dp.callback_query(F.data.startswith("seg_action_key_"))
-async def action_edit_key(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminStates.editing_answer_key)
-    await callback.message.answer("متن جدید پاسخ را ارسال کنید:")
-    await callback.answer()
-
-@dp.message(AdminStates.editing_answer_key, F.text)
-async def save_edited_key(message: Message, state: FSMContext):
-    data = await state.get_data()
-    seg_id = data.get("editing_seg_id")
-    conn = sqlite3.connect("bot_database.db")
-    cursor = conn.cursor()
-    cursor.execute("UPDATE segments SET answer_key = ? WHERE id = ?", (message.text, seg_id))
-    conn.commit()
-    conn.close()
-    await state.clear()
-    await message.answer("✅ پاسخ با موفقیت ویرایش شد.")
-    await show_admin_panel(message)
-
-@dp.callback_query(F.data.startswith("seg_action_tip_"))
-async def action_edit_tip(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminStates.editing_tip)
-    await callback.message.answer("متن جدید راهنما (Tip) را ارسال کنید:")
-    await callback.answer()
-
-@dp.message(AdminStates.editing_tip, F.text)
-async def save_edited_tip(message: Message, state: FSMContext):
-    data = await state.get_data()
-    seg_id = data.get("editing_seg_id")
-    conn = sqlite3.connect("bot_database.db")
-    cursor = conn.cursor()
-    cursor.execute("UPDATE segments SET segment_tip = ? WHERE id = ?", (message.text, seg_id))
-    conn.commit()
-    conn.close()
-    await state.clear()
-    await message.answer("✅ راهنمای سگمنت با موفقیت ویرایش شد.")
-    await show_admin_panel(message)
 
 @dp.callback_query(F.data.startswith("seg_action_del_"))
 async def action_delete_segment(callback: CallbackQuery, state: FSMContext):
@@ -501,7 +500,7 @@ async def action_delete_segment(callback: CallbackQuery, state: FSMContext):
     cursor.execute("DELETE FROM segments WHERE id = ?", (seg_id,))
     conn.commit()
     conn.close()
-    await callback.answer("سگمنت حذف شد.", show_alert=True)
+    await callback.answer("حذف شد.", show_alert=True)
     callback.data = f"manage_test_{test_id}"
     await manage_single_test(callback, state)
 
@@ -518,11 +517,11 @@ async def admin_view_results(callback: CallbackQuery):
     rows = cursor.fetchall()
     conn.close()
     if not rows:
-        await callback.message.edit_text("هیچ نتیجه‌ای ثبت نشده است.")
+        await callback.message.edit_text("نتیجه‌ای نیست.")
         return
-    text = "۵ تحلیل اخیر آزمون‌ها:\n\n"
-    for row in rows:
-        text += f"کاربر: {row[0] or 'بدون نام'}\nآزمون: {row[1]}\nزمان: {row[3]}\n{row[2][:150]}...\n-------------------\n"
+    text = "۵ تحلیل اخیر:\n\n"
+    for r in rows:
+        text += f"کاربر: {r[0]}\nآزمون: {r[1]}\n{r[2][:100]}...\n---\n"
     await callback.message.edit_text(text)
 
 @dp.callback_query(F.data == "admin_clear_db")
@@ -533,34 +532,42 @@ async def admin_clear_db(callback: CallbackQuery):
     cursor.execute("DELETE FROM segments")
     cursor.execute("DELETE FROM tests")
     cursor.execute("DELETE FROM users")
+    cursor.execute("DELETE FROM user_completed_tests")
     conn.commit()
     conn.close()
-    await callback.message.answer("تمام اطلاعات پاک شد.")
+    await callback.message.answer("پاکسازی شد.")
     await callback.answer()
 
 @dp.message(UserTestStates.taking_test, F.voice)
 async def handle_user_voice_test(message: Message, state: FSMContext):
-    conn_chk = sqlite3.connect("bot_database.db")
-    cur_chk = conn_chk.cursor()
-    cur_chk.execute("SELECT is_blocked FROM admins WHERE user_id = ?", (message.from_user.id,))
-    block_row = cur_chk.fetchone()
-    conn_chk.close()
-    if block_row and block_row[0] == 1:
-        await message.answer("❌ دسترسی شما مسدود شده است.")
-        return
-
+    user_id = message.from_user.id
     data = await state.get_data()
+    test_id = data.get("test_id")
     test_title = data.get("test_title")
     test_type = data.get("test_type")
     segments = data.get("segments")
     curr_idx = data.get("current_index")
     session_results = data.get("session_results")
+    
+    audio_prompt_id = data.get("last_audio_prompt_id")
+    title_prompt_id = data.get("last_title_prompt_id")
+
+    # حذف پیام‌های قبلی و ویس‌های فرستاده شده ربات از چت
+    try:
+        if audio_prompt_id:
+            await bot.delete_message(chat_id=message.chat.id, message_id=audio_prompt_id)
+        if title_prompt_id:
+            await bot.delete_message(chat_id=message.chat.id, message_id=title_prompt_id)
+        # حذف ویس ارسالی خود کاربر
+        await message.delete()
+    except:
+        pass
 
     seg_tuple = segments[curr_idx]
     answer_key, segment_lang = seg_tuple[2], seg_tuple[3]
 
-    status_msg = await message.answer(f"در حال پردازش سگمنت {curr_idx + 1}...")
-    file_path = f"voice_{message.from_user.id}.ogg"
+    status_msg = await message.answer(f"⏳ در حال پردازش سگمنت {curr_idx + 1}...")
+    file_path = f"voice_{user_id}.ogg"
 
     try:
         if not GEMINI_API_KEY:
@@ -638,7 +645,7 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
 
         if analysis_result.startswith("INVALID_AUDIO:"):
             error_details = analysis_result.replace("INVALID_AUDIO:", "").strip()
-            await status_msg.edit_text(f"اخطار در بررسی فایل صوتی:\n\n{error_details}\n\nلطفاً همین سگمنت را دوباره ارسال کنید.")
+            await status_msg.edit_text(f"اخطار در بررسی فایل صوتی:\n\n{error_details}\n\nلطفاً همین سگمنت را دوباره ویس بفرستید.")
             return
 
         await status_msg.delete()
@@ -649,8 +656,14 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
             await state.update_data(current_index=next_idx, session_results=session_results)
             await show_segment_tip(message, state)
         else:
+            # ذخیره کردن اینکه کاربر این آزمون را کامل انجام داده است
+            conn = sqlite3.connect("bot_database.db")
+            cursor = conn.cursor()
+            cursor.execute("INSERT OR REPLACE INTO user_completed_tests (user_id, test_id) VALUES (?, ?)", (user_id, test_id))
+            conn.commit()
+            conn.close()
+
             acc_list, lang_list, del_list, overall_list = [], [], [], []
-            
             for res in session_results:
                 acc_match = re.search(r"دقت\s*\(Accuracy\):\s*(\d+)%", res)
                 lang_match = re.search(r"زبان\s*\(Language\):\s*(\d+)%", res)
