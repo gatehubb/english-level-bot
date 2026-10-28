@@ -230,7 +230,7 @@ async def process_test_type(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "admin_upload_zip")
 async def admin_upload_zip(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer("لطفاً فایل زیپ (.zip) شامل فایل اسکریپت و پوشه صوت‌ها را ارسال کنید.")
+    await callback.message.answer("لطفاً فایل زیپ (.zip) شامل فایل اسکریپت (.txt) و پوشه صوت‌ها را ارسال کنید.")
     await state.set_state(AdminStates.waiting_for_zip_file)
     await callback.answer()
 
@@ -263,7 +263,7 @@ async def process_zip_test_type(callback: CallbackQuery, state: FSMContext):
     extract_dir = data.get("extract_dir")
     zip_filename = data.get("zip_filename")
 
-    status_msg = await callback.message.edit_text("📥 در حال استخراج و تحلیل هوشمند فایل اسکریپت و صوت‌ها...")
+    status_msg = await callback.message.edit_text("📥 در حال استخراج و تحلیل دقیق فایل متنی و صوت‌ها...")
 
     try:
         txt_file_path = None
@@ -271,14 +271,13 @@ async def process_zip_test_type(callback: CallbackQuery, state: FSMContext):
 
         for root, dirs, files in os.walk(extract_dir):
             for file in files:
-                # پذیرش هر فایلی که صوتی یا زیپ نباشد به عنوان فایل اسکریپت
-                if not file.lower().endswith(('.mp3', '.ogg', '.wav', '.zip', '.png', '.jpg', '.jpeg')) and not txt_file_path:
+                if file.lower().endswith('.txt') and not txt_file_path:
                     txt_file_path = os.path.join(root, file)
                 elif file.lower().endswith(('.mp3', '.ogg', '.wav')):
                     audio_files_map[file] = os.path.join(root, file)
 
         if not txt_file_path:
-            await status_msg.edit_text("❌ هیچ فایل اسکریپتی داخل فایل زیپ پیدا نشد.")
+            await status_msg.edit_text("❌ فایل متنی (.txt) داخل فایل زیپ پیدا نشد. لطفاً مطمئن شوید فایل تکست با پسوند txt داخل زیپ قرار دارد.")
             shutil.rmtree(extract_dir)
             await state.clear()
             return
@@ -320,7 +319,7 @@ async def process_zip_test_type(callback: CallbackQuery, state: FSMContext):
                     })
 
         if not dialogues_data:
-            await status_msg.edit_text("❌ ساختار اسکریپت شناسایی نشد یا هیچ سگمنتی استخراج نشد.")
+            await status_msg.edit_text("❌ ساختار داخل فایل متنی شناسایی نشد یا هیچ سگمنتی استخراج نشد.")
             shutil.rmtree(extract_dir)
             await state.clear()
             return
