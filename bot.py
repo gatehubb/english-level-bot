@@ -10,7 +10,12 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-import google.generativeai as genai
+
+# ایمپورت ایمن کتابخانه جمینای
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
 
 logging.basicConfig(level=logging.INFO)
 
@@ -18,11 +23,11 @@ TELEGRAM_BOT_TOKEN = "8834529401:AAFEVB8Xyzob8PVkN-V2Qn0MfZ41NscWkAw"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 ADMIN_PASSWORD = "2377451"
 
-# ⚠️ حتماً این دو مقدار را با اطلاعات واقعی کانال خودتان پر کنید:
-CHANNEL_USERNAME = "@YourChannelUsername"  # مثل @MyNaatiChannel
+# ⚠️ آیدی یوزرنیم کانال خود را اینجا وارد کنید (مثلا @YourChannel)
+CHANNEL_USERNAME = "@YourChannelUsername"
 CHANNEL_LINK = "https://t.me/YourChannelUsername"
 
-if GEMINI_API_KEY:
+if GEMINI_API_KEY and genai:
     genai.configure(api_key=GEMINI_API_KEY)
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -479,7 +484,6 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
                 file = await bot.get_file(item["voice_file_id"])
                 await bot.download_file(file.file_path, file_path)
                 
-                # آپلود صحیح فایل صوتی در گوگل جنرال‌اس‌پی
                 audio_file = genai.upload_file(file_path=file_path)
 
                 system_prompt = f"""
@@ -602,12 +606,12 @@ async def check_channel_membership(callback: CallbackQuery, state: FSMContext):
     try:
         member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
         if member.status in ["member", "administrator", "creator"]:
-            await callback.message.answer("عضویت شما تأیید شد!")
+            await callback.message.answer("عضویت شما تأیید شد! نقشه راه و متریال آموزشی شما آماده است.")
             await state.clear()
         else:
             await callback.answer("شما هنوز در کانال عضو نشده‌اید!", show_alert=True)
     except Exception as e:
-        await callback.answer(f"خطا در بررسی عضویت: {e}", show_alert=True)
+        await callback.answer("خطا در بررسی عضویت. مطمئن شوید یوزرنیگ کانال را درست وارد کرده‌اید و ربات ادمین کانال است.", show_alert=True)
 
 async def main():
     flask_thread = threading.Thread(target=run_flask, daemon=True)
