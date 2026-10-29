@@ -6,7 +6,7 @@ import re
 import threading
 from flask import Flask
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -50,15 +50,13 @@ def init_db():
     cursor.execute("CREATE TABLE IF NOT EXISTS segments (id INTEGER PRIMARY KEY AUTOINCREMENT, test_id INTEGER, file_id TEXT, answer_key TEXT, segment_index INTEGER, segment_lang TEXT, speaker_info TEXT, segment_tip TEXT, FOREIGN KEY(test_id) REFERENCES tests(id) ON DELETE CASCADE)")
     cursor.execute("CREATE TABLE IF NOT EXISTS results (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, test_title TEXT, analysis TEXT, date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     
-    # 🌟 ایجاد خودکار یک آزمون پیش‌فرض دائمی در صورت خالی بودن دیتابیس
     cursor.execute("SELECT COUNT(*) FROM tests")
     if cursor.fetchone()[0] == 0:
         cursor.execute("INSERT INTO tests (title, test_type) VALUES (?, ?)", ("آزمون پیش‌فرض تعیین سطح", "placement"))
         test_id = cursor.lastrowid
-        # سگمنت نمونه (می‌توانید file_id ویس واقعی خود را اینجا قرار دهید تا با هر آپدیت گیت‌هاب هرگز پاک نشود)
         cursor.execute(
             "INSERT INTO segments (test_id, file_id, answer_key, segment_index, segment_lang, speaker_info, segment_tip) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (test_id, "AwACAgQAAxkBAAIC1m..._sample_file_id", "این یک پاسخ نمونه برای تست است.", 1, "en", "Giver 1", "لطفاً به اعداد و اسامی دقت کنید.")
+            (test_id, "sample_file_id", "پاسخ نمونه", 1, "en", "Giver 1", "راهنمای تست")
         )
     conn.commit()
     conn.close()
@@ -73,17 +71,22 @@ class AdminStates(StatesGroup):
     waiting_for_segment_tip = State()
     waiting_for_segment_key = State()
     waiting_for_broadcast_message = State()
-    editing_answer_key = State()
-    editing_audio = State()
-    editing_tip = State()
-    editing_test_title = State()
 
 class UserTestStates(StatesGroup):
     taking_test = State()
     waiting_for_tip_ack = State()
 
-@dp.message(F.text == "/start")
-async def cmd_start(message: Message, state: FSMContext):
+# ⌨️ دکمه‌های ثابت پایین صفحه (کیبورد اصلی)
+def get_main_reply_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🚀 شروع آزمون"), KeyboardButton(text="🔙 منوی قبل")]
+        ],
+        resize_keyboard=True
+    )
+
+@dp.message(F.text.in_(["/start", "🚀 شروع آزمون", "🔙 منوی قبل"]))
+async def cmd_start_or_menu(message: Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
     username = message.from_user.username or ""
@@ -107,7 +110,7 @@ async def cmd_start(message: Message, state: FSMContext):
     conn.close()
 
     if not tests:
-        await message.answer("سلام! به ربات تعیین سطح خوش آمدید. در حال حاضر آزمونی فعال نیست.")
+        await message.answer("سلام! در حال حاضر هیچ آزمونی فعال نشده است.", reply_markup=get_main_reply_keyboard())
         return
 
     keyboard_buttons = []
@@ -116,7 +119,9 @@ async def cmd_start(message: Message, state: FSMContext):
         keyboard_buttons.append([InlineKeyboardButton(text=f"{type_label}: {t_title}", callback_data=f"start_test_{t_id}")])
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-    await message.answer("سلام! به بخش آزمون‌های ترجمه شفاهی خوش آمدید.\n\nلطفاً یکی از آزمون‌های زیر را انتخاب کنید:", reply_markup=keyboard)
+    await message.answer("سلام! به بخش آزمون‌های ترجمه شفاهی خوش آمدید.\n\nلطفاً یکی از آزمون‌های زیر را از لیست انتخاب کنید:", reply_markup=keyboard)
+    # اطمینان از ماندن دکمه‌های ثابت پایین صفحه
+    await message.answer("👇 از منوی زیر نیز می‌توانید استفاده کنید:", reply_markup=get_main_reply_keyboard())
 
 @dp.callback_query(F.data.startswith("start_test_"))
 async def user_start_test(callback: CallbackQuery, state: FSMContext):
@@ -240,22 +245,22 @@ async def process_admin_password(message: Message, state: FSMContext):
             cursor.execute("INSERT OR REPLACE INTO admins (user_id, failed_attempts, is_blocked) VALUES (?, ?, 0)", (user_id, failed))
             conn.commit()
             conn.close()
-            await message.answer(f"رمز عبور اشتباه است.")
+            await message.answer("رمز عبور اشتباه است.")
 
 async def show_admin_panel(message: Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="ساخت آزمون جدید (گام به گام)", callback_data="admin_create_manual")],
-        [InlineKeyboardButton(text="✏️ مدیریت، ویرایش آزمون‌ها و سگمنت‌ها", callback_data="admin_manage_tests")],
-        [InlineKeyboardButton(text="📢 ارسال نوتیفیکیشن همگانی", callback_data="admin_broadcast")],
-        [InlineKeyboardButton(text="مشاهده نتایج کاربران", callback_data="admin_view_results")],
-        [InlineKeyboardButton(text="پاکسازی کل اطلاعات", callback_data="admin_clear_db")]
+        [InlineKeyboardButton(text="✏️ مدیریت آزمون‌ها", callback_data="admin_manage_tests")],
+        [InlineKeyboardButton(text="📢 ارسال نوتیفیکیشن", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="مشاهده نتایج", callback_data="admin_view_results")],
+        [InlineKeyboardButton(text="پاکسازی اطلاعات", callback_data="admin_clear_db")]
     ])
     await message.answer("پنل مدیریت پیشرفته:", reply_markup=keyboard)
 
 @dp.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_broadcast_message)
-    await callback.message.answer("📢 متن پیام نوتیفیکیشن را بفرستید:")
+    await callback.message.answer("📢 متن پیام همگانی را بفرستید:")
     await callback.answer()
 
 @dp.message(AdminStates.waiting_for_broadcast_message, F.text)
@@ -596,7 +601,7 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
             except Exception as err:
                 logging.error(f"Failed to send report to admin {admin_id}: {err}")
 
-        await status_msg.edit_text("✅ آزمون به پایان رسید و کارنامه برای ادمین ارسال شد.")
+        await status_msg.edit_text("✅ آزمون به پایان رسید و کارنامه برای ادمین ارسال شد.", reply_markup=get_main_reply_keyboard())
         await state.clear()
 
 @dp.callback_query(F.data.startswith("approve_"))
@@ -605,7 +610,7 @@ async def admin_approve_report(callback: CallbackQuery, state: FSMContext):
     report = callback.message.text.replace("📋 درخواست بررسی کارنامه جدید", "📋 **کارنامه نهایی آزمون شما**")
     
     try:
-        await bot.send_message(chat_id=target_user_id, text=f"🎉 **کارنامه و نتیجه آزمون شما توسط ادمین تایید و ارسال شد:**\n\n{report}")
+        await bot.send_message(chat_id=target_user_id, text=f"🎉 **کارنامه و نتیجه آزمون شما توسط ادمین تایید و ارسال شد:**\n\n{report}", reply_markup=get_main_reply_keyboard())
         await bot.send_message(chat_id=target_user_id, text="🔒 برای دریافت برنامه تمرینی، لطفاً در کانال ما عضو شوید:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="عضویت در کانال", url=CHANNEL_LINK)],
             [InlineKeyboardButton(text="بررسی عضویت", callback_data="check_channel_membership")]
@@ -619,7 +624,7 @@ async def admin_approve_report(callback: CallbackQuery, state: FSMContext):
 async def admin_reject_report(callback: CallbackQuery, state: FSMContext):
     target_user_id = int(callback.data.split("_")[1])
     try:
-        await bot.send_message(chat_id=target_user_id, text="❌ متأسفانه کارنامه آزمون شما توسط ادمین تایید نشد.")
+        await bot.send_message(chat_id=target_user_id, text="❌ متأسفانه کارنامه آزمون شما توسط ادمین تایید نشد.", reply_markup=get_main_reply_keyboard())
         await callback.message.edit_text(callback.message.text + "\n\n❌ **وضعیت: رد شد**")
     except Exception as e:
         await callback.answer(f"خطا: {e}", show_alert=True)
@@ -631,7 +636,7 @@ async def check_channel_membership(callback: CallbackQuery, state: FSMContext):
     try:
         member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
         if member.status in ["member", "administrator", "creator"]:
-            await callback.message.answer("عضویت شما تأیید شد!")
+            await callback.message.answer("عضویت شما تأیید شد!", reply_markup=get_main_reply_keyboard())
             await state.clear()
         else:
             await callback.answer("شما هنوز در کانال عضو نشده‌اید!", show_alert=True)
