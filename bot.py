@@ -10,15 +10,20 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from google import genai
+import google.generativeai as genai
 
 logging.basicConfig(level=logging.INFO)
 
 TELEGRAM_BOT_TOKEN = "8834529401:AAFEVB8Xyzob8PVkN-V2Qn0MfZ41NscWkAw"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 ADMIN_PASSWORD = "2377451"
-CHANNEL_USERNAME = "@YourChannelUsername"
+
+# ⚠️ حتماً این دو مقدار را با اطلاعات واقعی کانال خودتان پر کنید:
+CHANNEL_USERNAME = "@YourChannelUsername"  # مثل @MyNaatiChannel
 CHANNEL_LINK = "https://t.me/YourChannelUsername"
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -66,14 +71,12 @@ class UserTestStates(StatesGroup):
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    
     user_id = message.from_user.id
     username = message.from_user.username or ""
     
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     cursor.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, username))
-    
     cursor.execute("SELECT is_blocked FROM admins WHERE user_id = ?", (user_id,))
     admin_row = cursor.fetchone()
     conn.commit()
@@ -200,17 +203,14 @@ async def process_admin_password(message: Message, state: FSMContext):
     user_id = message.from_user.id
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
-    
     cursor.execute("SELECT failed_attempts FROM admins WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
     failed = row[0] if row else 0
 
     if message.text == ADMIN_PASSWORD:
-        # ثبت خودکار کاربر به عنوان ادمین در دیتابیس
         cursor.execute("INSERT OR REPLACE INTO admins (user_id, failed_attempts, is_blocked) VALUES (?, 0, 0)", (user_id,))
         conn.commit()
         conn.close()
-        
         await state.clear()
         await message.answer("ورود با موفقیت انجام شد!")
         await show_admin_panel(message)
@@ -382,7 +382,6 @@ async def admin_manage_tests(callback: CallbackQuery, state: FSMContext):
         await show_admin_panel(callback.message)
         await callback.answer()
         return
-    # اصلاح خطای پرانتز آکولاد در این بخش
     buttons = [[InlineKeyboardButton(text=f"📂 {t[1]} ({t[2]})", callback_data=f"manage_test_{t[0]}")] for t in tests]
     buttons.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin_back_to_main")])
     await callback.message.edit_text("آزمون را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
@@ -445,7 +444,6 @@ async def admin_clear_db(callback: CallbackQuery):
     await callback.message.answer("پاکسازی انجام شد.")
     await callback.answer()
 
-# دریافت ویس‌های کاربر و جمع‌آوری برای پایان آزمون
 @dp.message(UserTestStates.taking_test, F.voice)
 async def handle_user_voice_test(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -463,14 +461,13 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
         await state.update_data(current_index=next_idx, user_voices=user_voices)
         await show_segment_tip(message, state)
     else:
-        status_msg = await message.answer("⏳ آزمون شما به پایان رسید. در حال پردازش هوش مصنوعی و ارسال برای بررسی ادمین...")
+        status_msg = await message.answer("⏳ آزمون شما به پایان رسید. در حال تحلیل هوش مصنوعی و ارسال برای بررسی ادمین...")
         
         test_title = data.get("test_title")
         test_type = data.get("test_type")
         user_id = message.from_user.id
         username = message.from_user.username or message.from_user.full_name
 
-        ai_client = genai.Client(api_key=GEMINI_API_KEY)
         session_results = []
 
         for idx, item in enumerate(user_voices):
@@ -481,7 +478,9 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
             try:
                 file = await bot.get_file(item["voice_file_id"])
                 await bot.download_file(file.file_path, file_path)
-                audio_file = ai_client.files.upload(file=file_path)
+                
+                # آپلود صحیح فایل صوتی در گوگل جنرال‌اس‌پی
+                audio_file = genai.upload_file(file_path=file_path)
 
                 system_prompt = f"""
 تو یک سیستم ارزیابی حرفه‌ای آزمون ترجمه شفاهی NAATI CCL هستی.
@@ -489,7 +488,8 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
 نوع آزمون: {test_type}
 شماره سگمنت: {idx + 1}
 زبان مرجع: {segment_lang}
-خروجی را با این فرمت ارسال کن:
+
+ترجمه صدای کاربر را با کلید مرجع مقایسه کن و خروجی را دقیقاً با این فرمت ارسال کن:
 سگمنت {idx + 1}
 - دقت (Accuracy): [عدد]%
 - زبان (Language): [عدد]%
@@ -497,12 +497,9 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
 - نمره کل (Overall): [عدد]%
 توضیحات کوتاه: [متن]
 """
-                response = ai_client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=[system_prompt, audio_file]
-                )
+                model = genai.GenerativeModel("gemini-1.5-flash")
+                response = model.generate_content([system_prompt, audio_file])
                 session_results.append(response.text.strip())
-                ai_client.files.delete(name=audio_file.name)
             except Exception as e:
                 session_results.append(f"سگمنت {idx + 1}: خطا در تحلیل ({str(e)})")
             finally:
@@ -550,7 +547,6 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
 {advice}
 """
 
-        # ارسال مستقیم به پی‌وی تمام ادمین‌های ثبت‌شده در دیتابیس
         conn = sqlite3.connect("bot_database.db")
         cursor = conn.cursor()
         cursor.execute("SELECT user_id FROM admins WHERE is_blocked = 0")
@@ -577,8 +573,6 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("approve_"))
 async def admin_approve_report(callback: CallbackQuery, state: FSMContext):
     target_user_id = int(callback.data.split("_")[1])
-    
-    # استخراج متن کارنامه از پیام ارسالی به ادمین
     report = callback.message.text.replace("📋 درخواست بررسی کارنامه جدید", "📋 **کارنامه نهایی آزمون شما**")
     
     try:
@@ -613,7 +607,7 @@ async def check_channel_membership(callback: CallbackQuery, state: FSMContext):
         else:
             await callback.answer("شما هنوز در کانال عضو نشده‌اید!", show_alert=True)
     except Exception as e:
-        await callback.answer("خطا در بررسی عضویت.", show_alert=True)
+        await callback.answer(f"خطا در بررسی عضویت: {e}", show_alert=True)
 
 async def main():
     flask_thread = threading.Thread(target=run_flask, daemon=True)
