@@ -46,17 +46,19 @@ def init_db():
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY, failed_attempts INTEGER DEFAULT 0, is_blocked INTEGER DEFAULT 0)")
     cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-    cursor.execute("CREATE TABLE IF NOT EXISTS tests (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT UNIQUE, test_type TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-    cursor.execute("CREATE TABLE IF NOT EXISTS segments (id INTEGER PRIMARY KEY AUTOINCREMENT, test_id INTEGER, file_id TEXT, answer_key TEXT, segment_index INTEGER, segment_lang TEXT, speaker_info TEXT, segment_tip TEXT, FOREIGN KEY(test_id) REFERENCES tests(id) ON DELETE CASCADE)")
+    # اضافه شدن ستون custom_prompt به جدول tests برای ذخیره پرامپت اختصاصی تصحیح ادمین
+    cursor.execute("CREATE TABLE IF NOT EXISTS tests (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT UNIQUE, test_type TEXT, custom_prompt TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    cursor.execute("CREATE TABLE IF NOT EXISTS segments (id INTEGER PRIMARY KEY AUTOINCREMENT, test_id INTEGER, file_id TEXT, segment_index INTEGER, segment_lang TEXT, segment_tip TEXT, FOREIGN KEY(test_id) REFERENCES tests(id) ON DELETE CASCADE)")
     cursor.execute("CREATE TABLE IF NOT EXISTS results (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, test_title TEXT, analysis TEXT, date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     
     cursor.execute("SELECT COUNT(*) FROM tests")
     if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT INTO tests (title, test_type) VALUES (?, ?)", ("آزمون تعیین سطح نمونه", "placement"))
+        cursor.execute("INSERT INTO tests (title, test_type, custom_prompt) VALUES (?, ?, ?)", 
+                       ("آزمون تعیین سطح نمونه", "placement", "شما مصحح آزمون NAATI هستید. دقت، زبان و ارائه را بررسی کنید و نمره واقعی از 0 تا 100 بدهید."))
         test_id = cursor.lastrowid
         cursor.execute(
-            "INSERT INTO segments (test_id, file_id, answer_key, segment_index, segment_lang, speaker_info, segment_tip) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (test_id, "sample_file_id", "متن مرجع و کلید ارزیابی ترجمه این بخش...", 1, "en", "Giver 1", "به اعداد و نکات کلیدی دقت کنید.")
+            "INSERT INTO segments (test_id, file_id, segment_index, segment_lang, segment_tip) VALUES (?, ?, ?, ?, ?)",
+            (test_id, "sample_file_id", 1, "en", "نکات کلیدی و اعداد را با دقت یادداشت کنید.")
         )
     conn.commit()
     conn.close()
@@ -66,6 +68,7 @@ init_db()
 class AdminStates(StatesGroup):
     waiting_for_password = State()
     waiting_for_test_title = State()
+    waiting_for_custom_prompt = State()
     waiting_for_segment_lang = State()
     waiting_for_segment_audio = State()
     waiting_for_segment_tip = State()
@@ -126,10 +129,10 @@ async def user_start_test(callback: CallbackQuery, state: FSMContext):
     
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT title, test_type FROM tests WHERE id = ?", (test_id,))
+    cursor.execute("SELECT title, test_type, custom_prompt FROM tests WHERE id = ?", (test_id,))
     test_row = cursor.fetchone()
     
-    cursor.execute("SELECT id, file_id, answer_key, segment_lang, speaker_info, segment_tip FROM segments WHERE test_id = ? ORDER BY segment_index ASC", (test_id,))
+    cursor.execute("SELECT id, file_id, segment_lang, segment_tip FROM segments WHERE test_id = ? ORDER BY segment_index ASC", (test_id,))
     segments = cursor.fetchall()
     conn.close()
 
@@ -138,13 +141,14 @@ async def user_start_test(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    test_title, test_type = test_row
+    test_title, test_type, custom_prompt = test_row
 
     await state.set_state(UserTestStates.taking_test)
     await state.update_data(
         test_id=test_id,
         test_title=test_title,
         test_type=test_type,
+        custom_prompt=custom_prompt,
         segments=segments,
         current_index=0,
         user_voices=[]
@@ -159,7 +163,7 @@ async def show_segment_tip(message: Message, state: FSMContext):
     curr_idx = data.get("current_index")
     seg = segments[curr_idx]
     
-    tip_text = seg[5] if seg[5] else "• حتماً کاغذ و قلم همراه داشته باشید تا نکات و اعداد کلیدی را یادداشت کنید."
+    tip_text = seg[3] if seg[3] else "• حتماً کاغذ و قلم همراه داشته باشید تا نکات و اعداد کلیدی را یادداشت کنید."
     
     await state.set_state(UserTestStates.waiting_for_tip_ack)
     
@@ -167,7 +171,7 @@ async def show_segment_tip(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="✅ بله، متوجه شدم و آماده‌ام", callback_data="ack_tip_and_play")]
     ])
     
-    await message.answer(f"💡 **راهنمای سگمنت {curr_idx + 1} از {len(segments)}:**\n\n{tip_text}", reply_markup=keyboard)
+    await message.answer(f"💡 **راهنمای سگمنت {curr_idx + 1} از طول {len(segments)}:**\n\n{tip_text}", reply_markup=keyboard)
 
 @dp.callback_query(UserTestStates.waiting_for_tip_ack, F.data == "ack_tip_and_play")
 async def ack_tip_and_play(callback: CallbackQuery, state: FSMContext):
@@ -177,9 +181,9 @@ async def ack_tip_and_play(callback: CallbackQuery, state: FSMContext):
     curr_idx = data.get("current_index")
     seg = segments[curr_idx]
     
-    lang_dir = "انگلیسی به فارسی 🇬🇧 ➡️ 🇮🇷" if seg[3] == "en" else "فارسی به انگلیسی 🇮🇷 ➡️ 🇬🇧"
+    lang_dir = "انگلیسی به فارسی 🇬🇧 ➡️ 🇮🇷" if seg[2] == "en" else "فارسی به انگلیسی 🇮🇷 ➡️ 🇬🇧"
     
-    await callback.message.answer(f"🎧 **سگمنت {curr_idx + 1}** ({lang_dir})\nگوينده: {seg[4] if seg[4] else 'گوینده اصلی'}\n\nبه فایل صوتی زیر گوش دهید و ترجمه خود را به صورت ویس ارسال کنید:")
+    await callback.message.answer(f"🎧 **سگمنت {curr_idx + 1}** ({lang_dir})\n\nبه فایل صوتی زیر گوش دهید و ترجمه خود را به صورت ویس ارسال کنید:")
     
     try:
         await callback.message.answer_voice(voice=seg[1])
@@ -294,7 +298,7 @@ async def admin_create_manual(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("type_"))
 async def process_test_type(callback: CallbackQuery, state: FSMContext):
     t_type = callback.data.split("_")[1]
-    await state.update_data(test_type=t_type, segment_index=1)
+    await state.update_data(test_type=t_type)
     await callback.message.answer("عنوان آزمون را ارسال کنید:")
     await state.set_state(AdminStates.waiting_for_test_title)
     await callback.answer()
@@ -302,47 +306,63 @@ async def process_test_type(callback: CallbackQuery, state: FSMContext):
 @dp.message(AdminStates.waiting_for_test_title, F.text)
 async def process_test_title(message: Message, state: FSMContext):
     title = message.text
+    await state.update_data(test_title=title)
+    await message.answer("حالا **پرامپت تصحیح و نمره‌دهی هوش مصنوعی** را برای این آزمون وارد کنید (دستورالعمل چگونگی ارزیابی ویس‌ها توسط هوش مصنوعی):")
+    await state.set_state(AdminStates.waiting_for_custom_prompt)
+
+@dp.message(AdminStates.waiting_for_custom_prompt, F.text)
+async def process_custom_prompt(message: Message, state: FSMContext):
+    custom_prompt = message.text
     data = await state.get_data()
-    seg_index = data.get("segment_index")
+    title = data.get("test_title")
+    t_type = data.get("test_type")
 
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO tests (title, test_type) VALUES (?, ?)", (title, data.get("test_type")))
+        cursor.execute("INSERT INTO tests (title, test_type, custom_prompt) VALUES (?, ?, ?)", (title, t_type, custom_prompt))
         conn.commit()
         test_id = cursor.lastrowid
     except sqlite3.IntegrityError:
         conn.close()
-        await message.answer("این عنوان تکراری است:")
+        await message.answer("این عنوان تکراری است. لطفاً عنوان دیگری بفرستید:")
         return
     conn.close()
 
-    await state.update_data(test_id=test_id)
+    await state.update_data(test_id=test_id, segment_index=1)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="انگلیسی 🇬🇧", callback_data="lang_en"), InlineKeyboardButton(text="فارسی 🇮🇷", callback_data="lang_fa")]
     ])
-    await message.answer(f"زبان سگمنت {seg_index}:", reply_markup=keyboard)
+    await message.answer(f"آزمون «{title}» ثبت شد.\n\nزبان سگمنت شماره ۱:", reply_markup=keyboard)
 
 @dp.callback_query(F.data.startswith("lang_"))
 async def process_segment_lang(callback: CallbackQuery, state: FSMContext):
     lang = callback.data.split("_")[1]
     await state.update_data(segment_lang=lang)
-    await callback.message.answer("فایل صوتی سگمنت را بفرستید (بدون نیاز به کلید پاسخ):")
+    await callback.message.answer("فایل صوتی سگمنت را بفرستید:")
     await state.set_state(AdminStates.waiting_for_segment_audio)
     await callback.answer()
 
 @dp.message(AdminStates.waiting_for_segment_audio, F.voice | F.audio | F.document)
 async def process_segment_audio(message: Message, state: FSMContext):
     file_id = message.voice.file_id if message.voice else (message.audio.file_id if message.audio else message.document.file_id)
+    await state.update_data(file_id=file_id)
+    await message.answer("متن راهنما (Tip) این سگمنت را بفرستید (توصیه‌ها یا نکات برای کاربر):")
+    await state.set_state(AdminStates.waiting_for_segment_tip)
+
+@dp.message(AdminStates.waiting_for_segment_tip, F.text)
+async def process_segment_tip(message: Message, state: FSMContext):
     data = await state.get_data()
     test_id = data.get("test_id")
+    file_id = data.get("file_id")
+    segment_tip = message.text
     seg_index = data.get("segment_index")
     segment_lang = data.get("segment_lang")
 
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO segments (test_id, file_id, answer_key, segment_index, segment_lang, segment_tip) VALUES (?, ?, ?, ?, ?, ?)", 
-                   (test_id, file_id, "Standard Evaluation Key", seg_index, segment_lang, "به نکات و مفاهیم دقت کنید."))
+    cursor.execute("INSERT INTO segments (test_id, file_id, segment_index, segment_lang, segment_tip) VALUES (?, ?, ?, ?, ?)", 
+                   (test_id, file_id, seg_index, segment_lang, segment_tip))
     conn.commit()
     conn.close()
 
@@ -370,7 +390,6 @@ async def admin_finish_test(callback: CallbackQuery, state: FSMContext):
     await show_admin_panel(callback.message)
     await callback.answer()
 
-# مدیریت و حذف آزمون‌ها و سگمنت‌ها
 @dp.callback_query(F.data == "admin_manage_tests")
 async def admin_manage_tests(callback: CallbackQuery, state: FSMContext):
     conn = sqlite3.connect("bot_database.db")
@@ -440,7 +459,6 @@ async def admin_delete_segment(callback: CallbackQuery):
     conn.close()
     await callback.answer("سگمنت حذف شد!", show_alert=True)
     
-    # بازگشت به منوی مدیریت همان آزمون
     callback.data = f"manage_test_{test_id}"
     await manage_single_test(callback, None)
 
@@ -492,10 +510,11 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
         await state.update_data(current_index=next_idx, user_voices=user_voices)
         await show_segment_tip(message, state)
     else:
-        status_msg = await message.answer("⏳ آزمون به پایان رسید. هوش مصنوعی حرفه‌ای NAATI در حال تحلیل دقیق ویس‌های شماست...")
+        status_msg = await message.answer("⏳ آزمون به پایان رسید. هوش مصنوعی در حال گوش دادن و ارزیابی ترجمه شماست...")
         
         test_title = data.get("test_title")
         test_type = data.get("test_type")
+        custom_prompt = data.get("custom_prompt") or "ارزیابی دقیق ترجمه شفاهی"
         user_id = message.from_user.id
         username = message.from_user.username or message.from_user.full_name
 
@@ -503,7 +522,7 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
 
         for idx, item in enumerate(user_voices):
             seg_tuple = segments[idx]
-            segment_lang = seg_tuple[3]
+            segment_lang = seg_tuple[2]
             
             file_path = f"v_{user_id}_{idx}.ogg"
             audio_file = None
@@ -520,30 +539,29 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
                         raise Exception("خطا در پردازش صوت.")
                     await asyncio.sleep(2)
 
-                # 🌟 پرامپت اختصاصی و پیشرفته تصحیح آزمون ترجمه شفاهی
-                system_prompt = f"""
-You are an expert NAATI CCL professional interpreter examiner.
-Evaluate the user's audio translation for segment {idx + 1} (Language direction: {segment_lang}).
-Analyze the interpretation for accuracy, completeness, grammar, vocabulary, and professional delivery. Do not grade it as 50% arbitrarily; give realistic professional scores between 60% and 95% based on actual translation quality.
+                # 🌟 استفاده مستقیم از پرامپت سفارشی ادمین همراه با دستور ساختاردهی نمرات
+                full_prompt = f"""
+{custom_prompt}
 
-Provide your evaluation strictly in this format:
+زبان جهت ترجمه سگمنت {idx + 1}: {segment_lang}
+لطفاً فایل صوتی ارسالی کاربر را به عنوان پاسخ این سگمنت بررسی کن و خروجی را دقیقاً با این فرمت گزارش بده:
 سگمنت {idx + 1}
-- دقت (Accuracy): [گذاشتن عدد واقعی به درصد]%
-- زبان (Language): [گذاشتن عدد واقعی به درصد]%
-- ارائه (Delivery): [گذاشتن عدد واقعی به درصد]%
-- نمره کل (Overall): [گذاشتن میانگین واقعی]%
-توضیحات کوتاه: [تحلیل کوتاه عملکرد ترجمه]
+- دقت (Accuracy): [عدد از 0 تا 100]%
+- زبان (Language): [عدد از 0 تا 100]%
+- ارائه (Delivery): [عدد از 0 تا 100]%
+- نمره کل (Overall): [میانگین اعداد]%
+توضیحات کوتاه: [نظر تخصصی کوتاه درباره ترجمه]
 """
                 model = genai.GenerativeModel("gemini-1.5-flash")
-                response = model.generate_content([system_prompt, audio_file])
+                response = model.generate_content([full_prompt, audio_file])
                 
                 if response and response.text:
                     session_results.append(response.text.strip())
                 else:
-                    session_results.append(f"سگمنت {idx + 1}:\n- دقت (Accuracy): 75%\n- زبان (Language): 75%\n- ارائه (Delivery): 75%\n- نمره کل (Overall): 75%\nتوضیحات کوتاه: ارزیابی استاندارد انجام شد.")
+                    session_results.append(f"سگمنت {idx + 1}:\n- دقت (Accuracy): 0%\n- زبان (Language): 0%\n- ارائه (Delivery): 0%\n- نمره کل (Overall): 0%\nتوضیحات کوتاه: ویس نامعتبر یا خالی.")
                     
             except Exception as e:
-                session_results.append(f"سگمنت {idx + 1}:\n- دقت (Accuracy): 70%\n- زبان (Language): 70%\n- ارائه (Delivery): 70%\n- نمره کل (Overall): 70%\nتوضیحات کوتاه: تحلیل انجام شد.")
+                session_results.append(f"سگمنت {idx + 1}:\n- دقت (Accuracy): 0%\n- زبان (Language): 0%\n- ارائه (Delivery): 0%\n- نمره کل (Overall): 0%\nتوضیحات کوتاه: خطا در پردازش صوت ({str(e)})")
             finally:
                 if os.path.exists(file_path):
                     os.remove(file_path)
@@ -565,20 +583,12 @@ Provide your evaluation strictly in this format:
             if del_match: del_list.append(int(del_match.group(1)))
             if ov_match: overall_list.append(int(ov_match.group(1)))
 
-        avg_acc = sum(acc_list) // len(acc_list) if acc_list else 75
-        avg_lang = sum(lang_list) // len(lang_list) if lang_list else 75
-        avg_del = sum(del_list) // len(del_list) if del_list else 75
-        avg_overall = sum(overall_list) // len(overall_list) if overall_list else 75
+        avg_acc = sum(acc_list) // len(acc_list) if acc_list else 0
+        avg_lang = sum(lang_list) // len(lang_list) if lang_list else 0
+        avg_del = sum(del_list) // len(del_list) if del_list else 0
+        avg_overall = sum(overall_list) // len(overall_list) if overall_list else 0
 
-        if test_type == "placement":
-            if avg_overall < 65:
-                advice = "تفسیر و مشاوره: عملکرد شما نیاز به تمرین بیشتر و تسلط بر واژگان دارد."
-            elif avg_overall < 75:
-                advice = "تفسیر و مشاوره: عملکرد شما خوب است اما نیاز به رفع اشکال دقیق‌تر دارد."
-            else:
-                advice = "تفسیر و مشاوره: عملکرد شما عالی بود! آماده حضور در آزمون اصلی هستید."
-        else:
-            advice = "ارزیابی آزمون ماک کامل انجام شد."
+        advice = "ارزیابی آزمون انجام شد."
 
         report_summary = f"""
 📋 **درخواست بررسی کارنامه جدید**
@@ -630,7 +640,7 @@ async def admin_approve_report(callback: CallbackQuery, state: FSMContext):
         ]))
         await callback.message.edit_text(callback.message.text + "\n\n✅ **وضعیت: تایید و ارسال شد به کاربر**")
     except Exception as e:
-        await callback.answer(f"خطا: {e}", show_alert=True)
+        await callback.answer(f"خطا در ارسال به کاربر: {e}", show_alert=True)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("reject_"))
