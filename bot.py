@@ -3,6 +3,7 @@ import asyncio
 import logging
 import sqlite3
 import re
+import time
 import threading
 from flask import Flask
 from aiogram import Bot, Dispatcher, F
@@ -11,7 +12,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# ایمپورت ایمن کتابخانه جمینای
 try:
     import google.generativeai as genai
 except ImportError:
@@ -23,7 +23,6 @@ TELEGRAM_BOT_TOKEN = "8834529401:AAFEVB8Xyzob8PVkN-V2Qn0MfZ41NscWkAw"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 ADMIN_PASSWORD = "2377451"
 
-# ⚠️ آیدی یوزرنیم کانال خود را اینجا وارد کنید (مثلا @YourChannel)
 CHANNEL_USERNAME = "@YourChannelUsername"
 CHANNEL_LINK = "https://t.me/YourChannelUsername"
 
@@ -466,7 +465,7 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
         await state.update_data(current_index=next_idx, user_voices=user_voices)
         await show_segment_tip(message, state)
     else:
-        status_msg = await message.answer("⏳ آزمون شما به پایان رسید. در حال تحلیل هوش مصنوعی و ارسال برای بررسی ادمین...")
+        status_msg = await message.answer("⏳ آزمون شما به پایان رسید. در حال تحلیل دقیق هوش مصنوعی و ارسال برای بررسی ادمین...")
         
         test_title = data.get("test_title")
         test_type = data.get("test_type")
@@ -480,11 +479,16 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
             answer_key, segment_lang = seg_tuple[2], seg_tuple[3]
             
             file_path = f"v_{user_id}_{idx}.ogg"
+            audio_file = None
             try:
                 file = await bot.get_file(item["voice_file_id"])
                 await bot.download_file(file.file_path, file_path)
                 
+                # آپلود فایل صوتی با انتظار برای آماده‌سازی کامل در سرور گوگل
                 audio_file = genai.upload_file(file_path=file_path)
+                while audio_file.state.name == "PROCESSING":
+                    await asyncio.sleep(1)
+                    audio_file = genai.get_file(audio_file.name)
 
                 system_prompt = f"""
 تو یک سیستم ارزیابی حرفه‌ای آزمون ترجمه شفاهی NAATI CCL هستی.
@@ -509,6 +513,11 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
             finally:
                 if os.path.exists(file_path):
                     os.remove(file_path)
+                if audio_file:
+                    try:
+                        genai.delete_file(audio_file.name)
+                    except:
+                        pass
 
         acc_list, lang_list, del_list, overall_list = [], [], [], []
         for res in session_results:
@@ -611,7 +620,7 @@ async def check_channel_membership(callback: CallbackQuery, state: FSMContext):
         else:
             await callback.answer("شما هنوز در کانال عضو نشده‌اید!", show_alert=True)
     except Exception as e:
-        await callback.answer("خطا در بررسی عضویت. مطمئن شوید یوزرنیگ کانال را درست وارد کرده‌اید و ربات ادمین کانال است.", show_alert=True)
+        await callback.answer(f"خطا در بررسی عضویت: {e}", show_alert=True)
 
 async def main():
     flask_thread = threading.Thread(target=run_flask, daemon=True)
