@@ -15,8 +15,8 @@ logging.basicConfig(level=logging.INFO)
 TELEGRAM_BOT_TOKEN = "8834529401:AAFEVB8Xyzob8PVkN-V2Qn0MfZ41NscWkAw"
 ADMIN_PASSWORD = "2377451"
 
-CHANNEL_USERNAME = "@YourChannelUsername"
-CHANNEL_LINK = "https://t.me/YourChannelUsername"
+CHANNEL_USERNAME = "@Free_naati"
+CHANNEL_LINK = "https://t.me/Free_naati"
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -60,6 +60,7 @@ class AdminStates(StatesGroup):
     waiting_for_segment_audio = State()
     waiting_for_segment_tip = State()
     waiting_for_broadcast_message = State()
+    waiting_for_custom_report = State()
 
 class UserTestStates(StatesGroup):
     taking_test = State()
@@ -137,15 +138,13 @@ async def user_start_test(callback: CallbackQuery, state: FSMContext):
         test_type=test_type,
         segments=segments,
         current_index=0,
-        user_voices=[],
-        last_tip_msg_id=None,
-        last_audio_msg_id=None
+        user_voices=[]
     )
 
-    await show_segment_tip(callback.message, state, is_first=True)
+    await show_segment_tip(callback.message, state)
     await callback.answer()
 
-async def show_segment_tip(message: Message, state: FSMContext, is_first=False):
+async def show_segment_tip(message: Message, state: FSMContext):
     data = await state.get_data()
     segments = data.get("segments")
     curr_idx = data.get("current_index")
@@ -170,7 +169,7 @@ async def ack_tip_and_play(callback: CallbackQuery, state: FSMContext):
     curr_idx = data.get("current_index")
     seg = segments[curr_idx]
     
-    # پاک کردن پیام راهنمای قبلی
+    # حذف پیام راهنما بعد از کلیک
     tip_msg_id = data.get("last_tip_msg_id")
     if tip_msg_id:
         try:
@@ -180,7 +179,8 @@ async def ack_tip_and_play(callback: CallbackQuery, state: FSMContext):
 
     lang_dir = "انگلیسی به فارسی 🇬🇧 ➡️ 🇮🇷" if seg[2] == "en" else "فارسی به انگلیسی 🇮🇷 ➡️ 🇬🇧"
     
-    await callback.message.answer(f"🎧 **سگمنت {curr_idx + 1}** ({lang_dir})\n\nبه فایل صوتی زیر گوش دهید و ترجمه خود را به صورت ویس ارسال کنید:")
+    # ارسال پیام وضعیت راهنما
+    info_msg = await callback.message.answer(f"🎧 **سگمنت {curr_idx + 1}** ({lang_dir})\n\nبه فایل صوتی زیر گوش دهید و ترجمه خود را به صورت ویس ارسال کنید:")
     
     try:
         audio_msg = await callback.message.answer_voice(voice=seg[1])
@@ -190,7 +190,7 @@ async def ack_tip_and_play(callback: CallbackQuery, state: FSMContext):
         except:
             audio_msg = await callback.message.answer_document(document=seg[1])
             
-    await state.update_data(last_audio_msg_id=audio_msg.message_id)
+    await state.update_data(last_info_msg_id=info_msg.message_id, last_audio_msg_id=audio_msg.message_id)
     await callback.answer()
 
 @dp.message(UserTestStates.taking_test, F.voice)
@@ -200,26 +200,31 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
     curr_idx = data.get("current_index")
     user_voices = data.get("user_voices", [])
 
-    # پاک کردن صوت قبلی ربات از چت کاربر برای نظم بیشتر
+    # پاک کردن پیام اطلاعات و صوت ربات از چت کاربر به همراه ویس ارسالی کاربر
+    info_msg_id = data.get("last_info_msg_id")
     audio_msg_id = data.get("last_audio_msg_id")
-    if audio_msg_id:
-        try:
-            await bot.delete_message(chat_id=message.chat.id, message_id=audio_msg_id)
-            # همچنین پاک کردن پیام متن بالای صوت اگر خواستید یا نگه داشتن آن
-        except:
-            pass
+    user_voice_msg_id = message.message_id
+
+    for m_id in [info_msg_id, audio_msg_id, user_voice_msg_id]:
+        if m_id:
+            try:
+                await bot.delete_message(chat_id=message.chat.id, message_id=m_id)
+            except:
+                pass
 
     user_voices.append({
         "segment_index": curr_idx + 1,
         "voice_file_id": message.voice.file_id
     })
 
+    # نمایش پیام موفقیت‌آمیز برای سگمنت فعلی
+    await message.answer(f"✅ جواب سگمنت {curr_idx + 1} با موفقیت ارسال شد.")
+
     next_idx = curr_idx + 1
     if next_idx < len(segments):
         await state.update_data(current_index=next_idx, user_voices=user_voices)
         await show_segment_tip(message, state)
     else:
-        # پایان آزمون کاربر
         test_title = data.get("test_title")
         test_type = data.get("test_type")
         user_id = message.from_user.id
@@ -232,7 +237,6 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
             reply_markup=get_main_reply_keyboard()
         )
 
-        # ارسال به ادمین به همراه تمپلیت کارنامه
         conn = sqlite3.connect("bot_database.db")
         cursor = conn.cursor()
         cursor.execute("SELECT user_id FROM admins WHERE is_blocked = 0")
@@ -241,7 +245,7 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
 
         template_report = f"""
 📋 **کارنامه آزمون کاربر (آماده برای تکمیل توسط استاد)**
-👤 کاربر: @{username} (شناسه: `{user_id}`)
+👤 کاربر: @{username} (شناسه تنظیم شده: `{user_id}`)
 📚 آزمون: {test_title} ({test_type})
 
 📊 **نمرات و ارزیابی:**
@@ -259,7 +263,7 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
 """
 
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ تایید و ارسال کارنامه به کاربر", callback_data=f"approve_{user_id}")],
+            [InlineKeyboardButton(text="✏️ ارسال متن کارنامه سفارشی", callback_data=f"custom_rep_{user_id}")],
             [InlineKeyboardButton(text="❌ رد کردن", callback_data=f"reject_{user_id}")]
         ])
 
@@ -273,6 +277,49 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
                 logging.error(f"Failed to send report to admin {admin_id}: {err}")
 
         await state.clear()
+
+@dp.callback_query(F.data.startswith("custom_rep_"))
+async def admin_start_custom_report(callback: CallbackQuery, state: FSMContext):
+    target_user_id = int(callback.data.split("_")[2])
+    await state.set_state(AdminStates.waiting_for_custom_report)
+    await state.update_data(target_user_id=target_user_id, report_msg_id=callback.message.message_id)
+    
+    await callback.message.answer("✏️ لطفاً متن کامل کارنامه، نمرات و تمرین‌ها را به صورت یک پیام متنی بفرستید تا ربات آن را برای کاربر ارسال کند:")
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_custom_report, F.text)
+async def process_admin_custom_report(message: Message, state: FSMContext):
+    data = await state.get_data()
+    target_user_id = data.get("target_user_id")
+    custom_text = message.text
+    await state.clear()
+
+    final_report = f"🎉 **کارنامه و نتیجه آزمون شما تایید و ارسال شد:**\n\n{custom_text}"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="عضویت در کانال", url=CHANNEL_LINK)]
+    ])
+
+    try:
+        await bot.send_message(chat_id=target_user_id, text=final_report, reply_markup=keyboard)
+        await message.answer("✅ کارنامه سفارشی شما با موفقیت برای کاربر ارسال شد!", reply_markup=get_main_reply_keyboard())
+    except Exception as e:
+        await message.answer(f"❌ خطا در ارسال به کاربر: {e}")
+
+@dp.callback_query(F.data.startswith("reject_"))
+async def admin_reject_report(callback: CallbackQuery, state: FSMContext):
+    try:
+        target_user_id = int(callback.data.split("_")[1])
+    except:
+        target_user_id = 0
+        
+    try:
+        if target_user_id:
+            await bot.send_message(chat_id=target_user_id, text="❌ متأسفانه کارنامه آزمون شما نیاز به ویرایش یا بازبینی مجدد دارد.", reply_markup=get_main_reply_keyboard())
+        await callback.message.edit_text(callback.message.text + "\n\n❌ **وضعیت: رد شد**")
+    except Exception as e:
+        await callback.answer(f"خطا: {e}", show_alert=True)
+    await callback.answer()
 
 @dp.message(F.text == "/admin")
 async def cmd_admin(message: Message, state: FSMContext):
@@ -563,56 +610,6 @@ async def admin_clear_db(callback: CallbackQuery):
     conn.close()
     await callback.message.answer("پاکسازی کل اطلاعات انجام شد.")
     await callback.answer()
-
-@dp.callback_query(F.data.startswith("approve_"))
-async def admin_approve_report(callback: CallbackQuery, state: FSMContext):
-    # استخراج شناسه کاربر از متن یا دکمه
-    try:
-        target_user_id = int(callback.data.split("_")[1])
-    except:
-        await callback.answer("خطا در شناسایی کاربر.", show_alert=True)
-        return
-        
-    report = callback.message.text.replace("📋 کارنامه آزمون کاربر (آماده برای تکمیل توسط استاد)", "📋 **کارنامه نهایی آزمون شما**")
-    
-    try:
-        await bot.send_message(chat_id=target_user_id, text=f"🎉 **کارنامه و نتیجه آزمون شما تایید و ارسال شد:**\n\n{report}", reply_markup=get_main_reply_keyboard())
-        await bot.send_message(chat_id=target_user_id, text="🔒 برای دریافت متریال‌های آموزشی، لطفاً در کانال ما عضو شوید:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="عضویت در کانال", url=CHANNEL_LINK)],
-            [InlineKeyboardButton(text="بررسی عضویت", callback_data="check_channel_membership")]
-        ]))
-        await callback.message.edit_text(callback.message.text + "\n\n✅ **وضعیت: تایید و ارسال شد به کاربر**")
-    except Exception as e:
-        await callback.answer(f"خطا در ارسال به کاربر: {e}", show_alert=True)
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("reject_"))
-async def admin_reject_report(callback: CallbackQuery, state: FSMContext):
-    try:
-        target_user_id = int(callback.data.split("_")[1])
-    except:
-        target_user_id = 0
-        
-    try:
-        if target_user_id:
-            await bot.send_message(chat_id=target_user_id, text="❌ متأسفانه کارنامه آزمون شما نیاز به ویرایش یا بازبینی مجدد دارد.", reply_markup=get_main_reply_keyboard())
-        await callback.message.edit_text(callback.message.text + "\n\n❌ **وضعیت: رد شد**")
-    except Exception as e:
-        await callback.answer(f"خطا: {e}", show_alert=True)
-    await callback.answer()
-
-@dp.callback_query(F.data == "check_channel_membership")
-async def check_channel_membership(callback: CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    try:
-        member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
-        if member.status in ["member", "administrator", "creator"]:
-            await callback.message.answer("عضویت شما تأیید شد!", reply_markup=get_main_reply_keyboard())
-            await state.clear()
-        else:
-            await callback.answer("شما هنوز در کانال عضو نشده‌اید!", show_alert=True)
-    except Exception as e:
-        await callback.answer(f"خطا در بررسی عضویت: {e}", show_alert=True)
 
 async def main():
     flask_thread = threading.Thread(target=run_flask, daemon=True)
