@@ -590,20 +590,105 @@ async def admin_edit_prompt(callback: CallbackQuery, state: FSMContext):
     if not await require_admin(callback):
         return
     await state.set_state(AdminStates.waiting_for_prompt)
-    await callback.message.answer("پرامپت جدید تصحیح را بفرستید (برای بازگشت به پیش‌فرض بنویسید: default):")
+    current = get_prompt()
+    preview = current[:600] + ("..." if len(current) > 600 else "")
+    await callback.message.answer(
+        f"🧠 پرامپت فعلی ({len(current)} کاراکتر):\n\n{preview}\n\n"
+        "──────────\n"
+        "پرامپت جدید را در «یک پیام» بفرستید.\n"
+        "• برای برگشت به پیش‌فرض بنویسید: default\n"
+        "• برای لغو بنویسید: cancel"
+    )
     await callback.answer()
+
+
+def store_prompt(text):
+    with db() as conn:
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('grading_prompt', ?)", (text,))
+        conn.commit()
+
+
+async def review_prompt(prompt_text):
+    """Gemini پرامپت را بررسی می‌کند. خروجی: متنی که خط اول آن OK یا PROBLEM است."""
+    instruction = (
+        "You review grading prompts for a Telegram bot that sends interpreting-exam AUDIO "
+        "(original audio + candidate's spoken answer) directly to an AI grader. "
+        "Check the prompt: (1) it makes sense and is usable as a system instruction, "
+        "(2) it tells the model to evaluate from the audio itself (delivery, hesitations, tone, accuracy), "
+        "(3) it asks for a clear report format, (4) it has no contradictions, "
+        "(5) it does not encourage inventing content that was not heard. "
+        "Reply in Persian, plain text only, max 8 short lines. "
+        "The FIRST line must be exactly OK if the prompt is usable, or exactly PROBLEM if there are real issues. "
+        "After the first line: for OK give one short sentence summary; for PROBLEM list each issue and how to fix it."
+    )
+    resp = await gemini.aio.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[f"Prompt to review:\n\n{prompt_text}"],
+        config=types.GenerateContentConfig(system_instruction=instruction, temperature=0.1),
+    )
+    return (resp.text or "").strip()
 
 
 @dp.message(AdminStates.waiting_for_prompt, F.text)
 async def save_prompt(message: Message, state: FSMContext):
-    with db() as conn:
-        if message.text.strip().lower() == "default":
+    new_prompt = message.text.strip()
+
+    if new_prompt.lower() == "cancel":
+        await state.clear()
+        await message.answer("لغو شد. پرامپت قبلی بدون تغییر ماند.")
+        return
+
+    if new_prompt.lower() == "default":
+        with db() as conn:
             conn.execute("DELETE FROM settings WHERE key='grading_prompt'")
-        else:
-            conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('grading_prompt', ?)", (message.text,))
+            conn.commit()
+        await state.clear()
+        await message.answer("✅ پرامپت به حالت پیش‌فرض برگشت.")
+        return
+
+    if len(new_prompt) < 30:
+        await message.answer("⚠️ پرامپت خیلی کوتاه است (کمتر از ۳۰ کاراکتر). دوباره بفرستید، یا برای لغو بنویسید: cancel")
+        return
+
+    status = await message.answer("⏳ در حال ذخیره و تست اتصال به Gemini...")
+
+    with db() as conn:
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('grading_prompt', ?)", (new_prompt,))
         conn.commit()
     await state.clear()
-    await message.answer("✅ پرامپت ذخیره شد.")
+
+    # بررسی اینکه واقعاً ذخیره شده
+    saved = get_prompt()
+    saved_ok = (saved == new_prompt)
+
+    # تست سریع Gemini با همین پرامپت (برای اطمینان از سالم بودن API key و مدل)
+    try:
+        await asyncio.wait_for(
+            gemini.aio.models.generate_content(
+                model=GEMINI_MODEL,
+                contents="Connection test: reply with the single word OK.",
+                config=types.GenerateContentConfig(system_instruction=new_prompt, temperature=0.2, max_output_tokens=50),
+            ),
+            timeout=40,
+        )
+        test_line = f"✅ تست Gemini موفق بود (کلید API و مدل «{GEMINI_MODEL}» درست کار می‌کنند)."
+    except Exception as e:
+        test_line = f"⚠️ پرامپت ذخیره شد ولی تست Gemini خطا داد:\n{str(e)[:600]}"
+
+    warn = ""
+    if len(new_prompt) >= 3900:
+        warn = "\n⚠️ پرامپت شما خیلی بلند است. تلگرام پیام‌های بالای ۴۰۹۶ کاراکتر را تکه‌تکه می‌کند و ممکن است فقط بخش اول ذخیره شده باشد. بهتر است کوتاه‌ترش کنید."
+
+    preview = new_prompt[:300] + ("..." if len(new_prompt) > 300 else "")
+    await status.edit_text(
+        f"{'✅ پرامپت ذخیره شد' if saved_ok else '❌ ذخیره ناموفق بود'} ({len(new_prompt)} کاراکتر)\n\n"
+        f"{test_line}{warn}\n\nشروع پرامپت:\n{preview}"
+    )
+
+
+@dp.message(AdminStates.waiting_for_prompt)
+async def save_prompt_invalid(message: Message):
+    await message.answer("⚠️ فقط متن بفرستید (نه فایل/عکس/ویس). برای لغو بنویسید: cancel")
 
 
 # ---- پیام همگانی ----
