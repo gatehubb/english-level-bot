@@ -1,3 +1,35 @@
+# -*- coding: utf-8 -*-
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║  ربات آزمون ترجمه شفاهی (NAATI Mock)  |  تک‌فایل ماژولار           ║
+╚══════════════════════════════════════════════════════════════════╝
+
+فهرست بخش‌ها (برای پیدا کردن سریع کد: Ctrl+F و جستجوی "[SECTION n]")
+
+ [SECTION 1]  ایمپورت‌ها
+ [SECTION 2]  تنظیمات و متغیرهای محیطی (توکن، رمز، کلید Gemini، مدل)
+ [SECTION 3]  آبجکت‌های اصلی (bot, dp, gemini) + پرامپت پیش‌فرض
+ [SECTION 4]  وب‌سرور Flask (فقط برای health check هاستینگ)
+ [SECTION 5]  دیتابیس (ساخت جدول‌ها، تنظیمات: پرامپت و مدل)
+ [SECTION 6]  State ها (مراحل گفتگو برای ادمین و کاربر)
+ [SECTION 7]  ابزارهای کمکی تلگرام (کیبورد، ارسال پیام بلند، بررسی ادمین)
+ [SECTION 8]  سرویس تصحیح هوش مصنوعی (Gemini)
+ [SECTION 9]  بخش کاربر: /start، لیست آزمون‌ها، برگزاری آزمون
+ [SECTION 10] کارنامه: تایید / ارسال سفارشی / رد
+ [SECTION 11] ادمین: ورود با رمز و پنل اصلی
+ [SECTION 12] ادمین: ویرایش پرامپت و تغییر مدل Gemini
+ [SECTION 13] ادمین: پیام همگانی
+ [SECTION 14] ادمین: ساخت آزمون و سگمنت
+ [SECTION 15] ادمین: مدیریت و حذف آزمون/سگمنت
+ [SECTION 16] ادمین: مشاهده نتایج و پاکسازی دیتابیس
+ [SECTION 17] نقطه شروع برنامه (main)
+
+نکته: در aiogram ترتیب ثبت هندلرها مهم است؛ اولین هندلری که شرطش بخورد اجرا می‌شود.
+"""
+
+# ══════════════════════════════════════════════════════════════════
+# [SECTION 1] ایمپورت‌ها
+# ══════════════════════════════════════════════════════════════════
 import os
 import io
 import asyncio
@@ -21,31 +53,38 @@ from google.genai import types
 
 logging.basicConfig(level=logging.INFO)
 
-# ============================================================
-# تنظیمات (همه از Environment Variable خوانده می‌شوند)
-# ============================================================
+# ══════════════════════════════════════════════════════════════════
+# [SECTION 2] تنظیمات و متغیرهای محیطی
+#   همه‌ی موارد محرمانه از Environment Variable (پنل Render) خوانده می‌شوند.
+# ══════════════════════════════════════════════════════════════════
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+# مدل پیش‌فرض. از داخل ربات (پنل ادمین > تغییر مدل) هم قابل تغییر است.
+DEFAULT_GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_TIMEOUT = int(os.environ.get("GEMINI_TIMEOUT", "180"))  # ثانیه برای هر درخواست
 DB_PATH = os.environ.get("DB_PATH", "bot_database.db")
 
 CHANNEL_USERNAME = "@Free_naati"
 CHANNEL_LINK = "https://t.me/Free_naati"
 
-missing = [k for k, v in {
+_missing = [k for k, v in {
     "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
     "ADMIN_PASSWORD": ADMIN_PASSWORD,
     "GEMINI_API_KEY": GEMINI_API_KEY,
 }.items() if not v]
-if missing:
-    raise RuntimeError(f"Environment variable(s) not set: {', '.join(missing)}")
+if _missing:
+    raise RuntimeError(f"Environment variable(s) not set: {', '.join(_missing)}")
 
+# ══════════════════════════════════════════════════════════════════
+# [SECTION 3] آبجکت‌های اصلی + پرامپت پیش‌فرض
+# ══════════════════════════════════════════════════════════════════
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 gemini = genai.Client(api_key=GEMINI_API_KEY)
 
-background_tasks = set()  # نگه‌داری رفرنس تسک‌ها تا garbage collect نشوند
+background_tasks = set()  # نگه‌داری رفرنس تسک‌های پس‌زمینه (تا garbage collect نشوند)
 
 DEFAULT_PROMPT = """You are an expert NAATI CCL / interpreting examiner.
 You will receive, for each segment: (1) the ORIGINAL audio the candidate had to interpret, and (2) the CANDIDATE's spoken interpretation.
@@ -63,9 +102,9 @@ Format:
 تمرین‌های پیشنهادی:
 """
 
-# ============================================================
-# Flask (برای health check هاستینگ)
-# ============================================================
+# ══════════════════════════════════════════════════════════════════
+# [SECTION 4] وب‌سرور Flask (health check برای Render)
+# ══════════════════════════════════════════════════════════════════
 app = Flask(__name__)
 
 
@@ -79,10 +118,12 @@ def run_flask():
     app.run(host="0.0.0.0", port=port)
 
 
-# ============================================================
-# دیتابیس
-# ============================================================
+# ══════════════════════════════════════════════════════════════════
+# [SECTION 5] دیتابیس
+#   جدول‌ها: admins, users, tests, segments, results, settings, pending_reports
+# ══════════════════════════════════════════════════════════════════
 def db():
+    """اتصال به دیتابیس: with db() as conn: ..."""
     return closing(sqlite3.connect(DB_PATH))
 
 
@@ -97,13 +138,13 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS pending_reports (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, test_title TEXT, report TEXT)")
 
-        # مهاجرت: ستون نوع فایل صوتی
+        # مهاجرت: ستون نوع فایل صوتی سگمنت
         try:
             c.execute("ALTER TABLE segments ADD COLUMN file_mime TEXT")
         except sqlite3.OperationalError:
             pass
 
-        # مهاجرت: ستون is_admin (رفع باگ: قبلاً کسی که یک بار رمز غلط می‌زد ادمین حساب می‌شد)
+        # مهاجرت: ستون is_admin (رفع باگ: کسی که یک بار رمز غلط می‌زد ادمین حساب می‌شد)
         try:
             c.execute("ALTER TABLE admins ADD COLUMN is_admin INTEGER DEFAULT 0")
             c.execute("UPDATE admins SET is_admin = 1 WHERE failed_attempts = 0 AND is_blocked = 0")
@@ -124,15 +165,35 @@ def init_db():
 init_db()
 
 
-def get_prompt():
+def get_setting(key, default=None):
     with db() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key='grading_prompt'").fetchone()
-    return row[0] if row else DEFAULT_PROMPT
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else default
 
 
-# ============================================================
-# State ها
-# ============================================================
+def set_setting(key, value):
+    with db() as conn:
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+        conn.commit()
+
+
+def del_setting(key):
+    with db() as conn:
+        conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+        conn.commit()
+
+
+def get_prompt():
+    return get_setting("grading_prompt", DEFAULT_PROMPT)
+
+
+def get_model():
+    return get_setting("gemini_model", DEFAULT_GEMINI_MODEL)
+
+
+# ══════════════════════════════════════════════════════════════════
+# [SECTION 6] State ها
+# ══════════════════════════════════════════════════════════════════
 class AdminStates(StatesGroup):
     waiting_for_password = State()
     waiting_for_test_title = State()
@@ -142,6 +203,7 @@ class AdminStates(StatesGroup):
     waiting_for_broadcast_message = State()
     waiting_for_custom_report = State()
     waiting_for_prompt = State()
+    waiting_for_model = State()
 
 
 class UserTestStates(StatesGroup):
@@ -149,6 +211,9 @@ class UserTestStates(StatesGroup):
     waiting_for_tip_ack = State()
 
 
+# ══════════════════════════════════════════════════════════════════
+# [SECTION 7] ابزارهای کمکی تلگرام
+# ══════════════════════════════════════════════════════════════════
 def get_main_reply_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="🚀 شروع آزمون"), KeyboardButton(text="🔙 منوی قبل")]],
@@ -156,16 +221,15 @@ def get_main_reply_keyboard():
     )
 
 
-# ============================================================
-# توابع کمکی
-# ============================================================
 async def download_bytes(file_id):
+    """دانلود فایل تلگرام به صورت بایت (برای ارسال به Gemini)."""
     buf = io.BytesIO()
     await bot.download(file_id, destination=buf)
     return buf.getvalue()
 
 
 async def send_long(chat_id, text, reply_markup=None):
+    """ارسال متن بلند در چند پیام (حداکثر ۴۰۰۰ کاراکتر هر پیام)."""
     chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)] or [" "]
     for i, chunk in enumerate(chunks):
         await bot.send_message(chat_id, chunk, reply_markup=reply_markup if i == len(chunks) - 1 else None)
@@ -173,32 +237,98 @@ async def send_long(chat_id, text, reply_markup=None):
 
 def is_admin_user(user_id):
     with db() as conn:
-        row = conn.execute("SELECT 1 FROM admins WHERE user_id = ? AND is_admin = 1 AND is_blocked = 0", (user_id,)).fetchone()
+        row = conn.execute(
+            "SELECT 1 FROM admins WHERE user_id = ? AND is_admin = 1 AND is_blocked = 0", (user_id,)
+        ).fetchone()
     return bool(row)
 
 
+async def require_admin(callback: CallbackQuery):
+    """برای دکمه‌های پنل ادمین: اگر کلیک‌کننده ادمین نبود False برمی‌گرداند."""
+    if not is_admin_user(callback.from_user.id):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return False
+    return True
+
+
+# ══════════════════════════════════════════════════════════════════
+# [SECTION 8] سرویس تصحیح هوش مصنوعی (Gemini)
+#   روش کار: برای هر سگمنت یک درخواست جدا (صدای اصلی + ویس کاربر، مستقیم به‌صورت
+#   صوت، بدون تبدیل به متن) و در پایان یک درخواست جمع‌بندی برای نوشتن کارنامه نهایی
+#   طبق پرامپت ادمین. تصحیح سگمنت‌ها جدا انجام می‌شود تا درخواست‌ها سبک بمانند.
+# ══════════════════════════════════════════════════════════════════
+async def gemini_call(contents, system_prompt=None, model=None, attempts=3):
+    """یک درخواست به Gemini با timeout و تلاش مجدد برای خطاهای موقت (429/503)."""
+    model = model or get_model()
+    config = types.GenerateContentConfig(system_instruction=system_prompt) if system_prompt else None
+    last_err = None
+    for attempt in range(attempts):
+        try:
+            resp = await asyncio.wait_for(
+                gemini.aio.models.generate_content(model=model, contents=contents, config=config),
+                timeout=GEMINI_TIMEOUT,
+            )
+            return (resp.text or "").strip()
+        except Exception as err:
+            last_err = err
+            msg = str(err)
+            transient = any(k in msg for k in ("429", "503", "UNAVAILABLE", "RESOURCE_EXHAUSTED")) or isinstance(err, asyncio.TimeoutError)
+            if transient and attempt < attempts - 1:
+                await asyncio.sleep(5 * (attempt + 1))
+                continue
+            raise
+    raise last_err
+
+
+async def list_gemini_models():
+    """لیست مدل‌های Gemini که generateContent را پشتیبانی می‌کنند."""
+    names = []
+    pager = await gemini.aio.models.list()
+    async for m in pager:
+        actions = getattr(m, "supported_actions", None) or []
+        name = (m.name or "").replace("models/", "")
+        if "generateContent" in actions and name.startswith("gemini") and "embedding" not in name:
+            names.append(name)
+    return names
+
+
 async def grade_with_gemini(test_title, test_type, segments, user_voices):
-    parts = [types.Part.from_text(text=f"Test: {test_title} ({test_type}). Segments follow in order.")]
+    system_prompt = get_prompt()
+    notes = []
+
     for i, seg in enumerate(segments):
         direction = "English to Persian" if seg[2] == "en" else "Persian to English"
         src_mime = seg[4] if len(seg) > 4 and seg[4] else "audio/ogg"
         src_bytes = await download_bytes(seg[1])
         usr_bytes = await download_bytes(user_voices[i]["voice_file_id"])
-        parts.append(types.Part.from_text(text=f"--- Segment {i + 1} ({direction}) --- ORIGINAL audio:"))
-        parts.append(types.Part.from_bytes(data=src_bytes, mime_type=src_mime))
-        parts.append(types.Part.from_text(text=f"Segment {i + 1} CANDIDATE's interpretation:"))
-        parts.append(types.Part.from_bytes(data=usr_bytes, mime_type="audio/ogg"))
-    parts.append(types.Part.from_text(text="Now write the full report according to the instructions."))
 
-    resp = await gemini.aio.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=parts,
-        config=types.GenerateContentConfig(system_instruction=get_prompt(), temperature=0.2),
-    )
-    return resp.text
+        parts = [
+            types.Part.from_text(text=f"Test: {test_title} ({test_type}). Now evaluate ONLY segment {i + 1} ({direction})."),
+            types.Part.from_text(text="ORIGINAL audio:"),
+            types.Part.from_bytes(data=src_bytes, mime_type=src_mime),
+            types.Part.from_text(text="CANDIDATE's spoken interpretation:"),
+            types.Part.from_bytes(data=usr_bytes, mime_type="audio/ogg"),
+            types.Part.from_text(text=(
+                "Write detailed examiner notes in Persian for this segment only: accuracy (omissions, additions, "
+                "numbers, names), language quality, delivery (pronunciation, fluency, hesitations, fillers, pauses, tone), "
+                "concrete examples of errors, and a score for this segment. Base everything only on what you hear."
+            )),
+        ]
+        note = await gemini_call(parts, system_prompt=system_prompt)
+        notes.append(f"=== Segment {i + 1} ({direction}) ===\n{note or '(no output)'}")
+
+    final_contents = [
+        f"Test: {test_title} ({test_type}).",
+        "Below are your own detailed examiner notes for every segment (based on listening to the audio):",
+        "\n\n".join(notes),
+        "Now write the FINAL complete report for the candidate, following exactly the instructions and format in your system prompt.",
+    ]
+    report = await gemini_call(final_contents, system_prompt=system_prompt)
+    return report
 
 
 async def grade_and_notify(admin_ids, user_id, username, test_title, test_type, segments, user_voices):
+    """در پس‌زمینه اجرا می‌شود: تصحیح با Gemini و ارسال کارنامه‌ی پیشنهادی به ادمین."""
     try:
         report = await grade_with_gemini(test_title, test_type, segments, user_voices)
         if not report:
@@ -244,9 +374,9 @@ async def grade_and_notify(admin_ids, user_id, username, test_title, test_type, 
             logging.error(f"send report to admin {admin_id}: {err}")
 
 
-# ============================================================
-# بخش کاربر
-# ============================================================
+# ══════════════════════════════════════════════════════════════════
+# [SECTION 9] بخش کاربر: /start، لیست آزمون‌ها، برگزاری آزمون
+# ══════════════════════════════════════════════════════════════════
 @dp.message(F.text.in_(["/start", "🚀 شروع آزمون", "🔙 منوی قبل"]))
 async def cmd_start_or_menu(message: Message, state: FSMContext):
     await state.clear()
@@ -391,6 +521,7 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
         await show_segment_tip(message, state)
         return
 
+    # ---- آخرین سگمنت: پایان آزمون ----
     test_title = data.get("test_title")
     test_type = data.get("test_type")
     user_id = message.from_user.id
@@ -406,7 +537,7 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
     with db() as conn:
         admin_ids = [r[0] for r in conn.execute("SELECT user_id FROM admins WHERE is_admin = 1 AND is_blocked = 0").fetchall()]
 
-    # ارسال ویس‌های کاربر به ادمین برای شنیدن مستقیم
+    # ویس‌های کاربر برای شنیدن مستقیم توسط ادمین
     for admin_id in admin_ids:
         try:
             await bot.send_message(admin_id, f"📥 آزمون جدید از @{username} ({test_title}) دریافت شد. تصحیح هوش مصنوعی در حال انجام است...")
@@ -430,11 +561,13 @@ async def remind_send_voice(message: Message):
     await message.answer("🎙 لطفاً پاسخ خود را به صورت ویس (voice) ارسال کنید.")
 
 
-# ============================================================
-# کارنامه: تایید / سفارشی / رد
-# ============================================================
+# ══════════════════════════════════════════════════════════════════
+# [SECTION 10] کارنامه: تایید / ارسال سفارشی / رد
+# ══════════════════════════════════════════════════════════════════
 @dp.callback_query(F.data.startswith("approve_"))
 async def admin_approve_report(callback: CallbackQuery):
+    if not await require_admin(callback):
+        return
     pid = int(callback.data.split("_")[1])
     with db() as conn:
         row = conn.execute("SELECT user_id, username, test_title, report FROM pending_reports WHERE id=?", (pid,)).fetchone()
@@ -464,6 +597,8 @@ async def admin_approve_report(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("custom_rep_"))
 async def admin_start_custom_report(callback: CallbackQuery, state: FSMContext):
+    if not await require_admin(callback):
+        return
     target_user_id = int(callback.data.split("_")[2])
     await state.set_state(AdminStates.waiting_for_custom_report)
     await state.update_data(target_user_id=target_user_id)
@@ -489,6 +624,8 @@ async def process_admin_custom_report(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("reject_"))
 async def admin_reject_report(callback: CallbackQuery):
+    if not await require_admin(callback):
+        return
     try:
         target_user_id = int(callback.data.split("_")[1])
     except Exception:
@@ -512,9 +649,22 @@ async def admin_reject_report(callback: CallbackQuery):
     await callback.answer()
 
 
-# ============================================================
-# بخش ادمین
-# ============================================================
+# ══════════════════════════════════════════════════════════════════
+# [SECTION 11] ادمین: ورود با رمز و پنل اصلی
+# ══════════════════════════════════════════════════════════════════
+async def show_admin_panel(message: Message):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ ساخت آزمون جدید", callback_data="admin_create_manual")],
+        [InlineKeyboardButton(text="✏️ مدیریت و حذف آزمون‌ها/سگمنت‌ها", callback_data="admin_manage_tests")],
+        [InlineKeyboardButton(text="🧠 ویرایش پرامپت تصحیح", callback_data="admin_edit_prompt")],
+        [InlineKeyboardButton(text="🤖 تغییر مدل Gemini", callback_data="admin_edit_model")],
+        [InlineKeyboardButton(text="📢 ارسال نوتیفیکیشن", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="📊 مشاهده نتایج", callback_data="admin_view_results")],
+        [InlineKeyboardButton(text="🗑 پاکسازی کل دیتابیس", callback_data="admin_clear_db")],
+    ])
+    await message.answer("پنل مدیریت پیشرفته:", reply_markup=keyboard)
+
+
 @dp.message(F.text == "/admin")
 async def cmd_admin(message: Message, state: FSMContext):
     user_id = message.from_user.id
@@ -565,26 +715,18 @@ async def process_admin_password(message: Message, state: FSMContext):
         await message.answer("رمز عبور اشتباه است.")
 
 
-async def show_admin_panel(message: Message):
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ ساخت آزمون جدید", callback_data="admin_create_manual")],
-        [InlineKeyboardButton(text="✏️ مدیریت و حذف آزمون‌ها/سگمنت‌ها", callback_data="admin_manage_tests")],
-        [InlineKeyboardButton(text="🧠 ویرایش پرامپت تصحیح", callback_data="admin_edit_prompt")],
-        [InlineKeyboardButton(text="📢 ارسال نوتیفیکیشن", callback_data="admin_broadcast")],
-        [InlineKeyboardButton(text="📊 مشاهده نتایج", callback_data="admin_view_results")],
-        [InlineKeyboardButton(text="🗑 پاکسازی کل دیتابیس", callback_data="admin_clear_db")],
-    ])
-    await message.answer("پنل مدیریت پیشرفته:", reply_markup=keyboard)
+@dp.callback_query(F.data == "admin_back_to_main")
+async def admin_back_to_main(callback: CallbackQuery):
+    if not await require_admin(callback):
+        return
+    await show_admin_panel(callback.message)
+    await callback.answer()
 
 
-async def require_admin(callback: CallbackQuery):
-    if not is_admin_user(callback.from_user.id):
-        await callback.answer("دسترسی ندارید.", show_alert=True)
-        return False
-    return True
-
-
-# ---- ویرایش پرامپت ----
+# ══════════════════════════════════════════════════════════════════
+# [SECTION 12] ادمین: ویرایش پرامپت و تغییر مدل Gemini
+# ══════════════════════════════════════════════════════════════════
+# ---- 12-الف: ویرایش پرامپت تصحیح ----
 @dp.callback_query(F.data == "admin_edit_prompt")
 async def admin_edit_prompt(callback: CallbackQuery, state: FSMContext):
     if not await require_admin(callback):
@@ -602,33 +744,6 @@ async def admin_edit_prompt(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-def store_prompt(text):
-    with db() as conn:
-        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('grading_prompt', ?)", (text,))
-        conn.commit()
-
-
-async def review_prompt(prompt_text):
-    """Gemini پرامپت را بررسی می‌کند. خروجی: متنی که خط اول آن OK یا PROBLEM است."""
-    instruction = (
-        "You review grading prompts for a Telegram bot that sends interpreting-exam AUDIO "
-        "(original audio + candidate's spoken answer) directly to an AI grader. "
-        "Check the prompt: (1) it makes sense and is usable as a system instruction, "
-        "(2) it tells the model to evaluate from the audio itself (delivery, hesitations, tone, accuracy), "
-        "(3) it asks for a clear report format, (4) it has no contradictions, "
-        "(5) it does not encourage inventing content that was not heard. "
-        "Reply in Persian, plain text only, max 8 short lines. "
-        "The FIRST line must be exactly OK if the prompt is usable, or exactly PROBLEM if there are real issues. "
-        "After the first line: for OK give one short sentence summary; for PROBLEM list each issue and how to fix it."
-    )
-    resp = await gemini.aio.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[f"Prompt to review:\n\n{prompt_text}"],
-        config=types.GenerateContentConfig(system_instruction=instruction, temperature=0.1),
-    )
-    return (resp.text or "").strip()
-
-
 @dp.message(AdminStates.waiting_for_prompt, F.text)
 async def save_prompt(message: Message, state: FSMContext):
     new_prompt = message.text.strip()
@@ -639,9 +754,7 @@ async def save_prompt(message: Message, state: FSMContext):
         return
 
     if new_prompt.lower() == "default":
-        with db() as conn:
-            conn.execute("DELETE FROM settings WHERE key='grading_prompt'")
-            conn.commit()
+        del_setting("grading_prompt")
         await state.clear()
         await message.answer("✅ پرامپت به حالت پیش‌فرض برگشت.")
         return
@@ -652,32 +765,22 @@ async def save_prompt(message: Message, state: FSMContext):
 
     status = await message.answer("⏳ در حال ذخیره و تست اتصال به Gemini...")
 
-    with db() as conn:
-        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('grading_prompt', ?)", (new_prompt,))
-        conn.commit()
+    set_setting("grading_prompt", new_prompt)
     await state.clear()
+    saved_ok = (get_prompt() == new_prompt)  # بررسی اینکه واقعاً ذخیره شده
 
-    # بررسی اینکه واقعاً ذخیره شده
-    saved = get_prompt()
-    saved_ok = (saved == new_prompt)
-
-    # تست سریع Gemini با همین پرامپت (برای اطمینان از سالم بودن API key و مدل)
     try:
-        await asyncio.wait_for(
-            gemini.aio.models.generate_content(
-                model=GEMINI_MODEL,
-                contents="Connection test: reply with the single word OK.",
-                config=types.GenerateContentConfig(system_instruction=new_prompt, temperature=0.2, max_output_tokens=50),
-            ),
-            timeout=40,
-        )
-        test_line = f"✅ تست Gemini موفق بود (کلید API و مدل «{GEMINI_MODEL}» درست کار می‌کنند)."
+        await gemini_call("Connection test: reply with the single word OK.", system_prompt=new_prompt, attempts=1)
+        test_line = f"✅ تست Gemini موفق بود (کلید API و مدل «{get_model()}» درست کار می‌کنند)."
     except Exception as e:
-        test_line = f"⚠️ پرامپت ذخیره شد ولی تست Gemini خطا داد:\n{str(e)[:600]}"
+        test_line = (
+            f"⚠️ پرامپت ذخیره شد ولی تست Gemini خطا داد:\n{str(e)[:600]}\n\n"
+            "اگر خطا درباره‌ی مدل است، از پنل ادمین > «تغییر مدل Gemini» مدل را عوض کنید."
+        )
 
     warn = ""
     if len(new_prompt) >= 3900:
-        warn = "\n⚠️ پرامپت شما خیلی بلند است. تلگرام پیام‌های بالای ۴۰۹۶ کاراکتر را تکه‌تکه می‌کند و ممکن است فقط بخش اول ذخیره شده باشد. بهتر است کوتاه‌ترش کنید."
+        warn = "\n⚠️ پرامپت شما خیلی بلند است. تلگرام پیام‌های بالای ۴۰۹۶ کاراکتر را تکه‌تکه می‌کند و ممکن است فقط بخش اول ذخیره شده باشد."
 
     preview = new_prompt[:300] + ("..." if len(new_prompt) > 300 else "")
     await status.edit_text(
@@ -691,7 +794,66 @@ async def save_prompt_invalid(message: Message):
     await message.answer("⚠️ فقط متن بفرستید (نه فایل/عکس/ویس). برای لغو بنویسید: cancel")
 
 
-# ---- پیام همگانی ----
+# ---- 12-ب: تغییر مدل Gemini ----
+@dp.callback_query(F.data == "admin_edit_model")
+async def admin_edit_model(callback: CallbackQuery, state: FSMContext):
+    if not await require_admin(callback):
+        return
+    await callback.answer()
+    status = await callback.message.answer("⏳ در حال گرفتن لیست مدل‌های در دسترس...")
+    try:
+        models = await list_gemini_models()
+        models = sorted(set(models))
+        listing = "\n".join(f"• {m}" for m in models[:25]) if models else "(لیستی دریافت نشد)"
+    except Exception as e:
+        listing = f"(خطا در گرفتن لیست: {str(e)[:200]})"
+
+    await state.set_state(AdminStates.waiting_for_model)
+    await status.edit_text(
+        f"🤖 مدل فعلی: {get_model()}\n\n"
+        f"مدل‌های در دسترس کلید شما:\n{listing}\n\n"
+        "──────────\n"
+        "اسم مدل جدید را بفرستید (مثلاً gemini-3.8-flash).\n"
+        "مدل قبل از ذخیره تست می‌شود و اگر کار نکند ذخیره نمی‌شود.\n"
+        "• برگشت به پیش‌فرض: default\n"
+        "• لغو: cancel"
+    )
+
+
+@dp.message(AdminStates.waiting_for_model, F.text)
+async def save_model(message: Message, state: FSMContext):
+    name = message.text.strip().replace("models/", "")
+
+    if name.lower() == "cancel":
+        await state.clear()
+        await message.answer("لغو شد. مدل قبلی بدون تغییر ماند.")
+        return
+
+    if name.lower() == "default":
+        del_setting("gemini_model")
+        await state.clear()
+        await message.answer(f"✅ مدل به پیش‌فرض برگشت: {DEFAULT_GEMINI_MODEL}")
+        return
+
+    if " " in name or len(name) > 80:
+        await message.answer("⚠️ اسم مدل معتبر نیست. فقط اسم مدل را بفرستید، یا برای لغو بنویسید: cancel")
+        return
+
+    status = await message.answer(f"⏳ در حال تست مدل {name} ...")
+    try:
+        await gemini_call("Connection test: reply with the single word OK.", model=name, attempts=1)
+    except Exception as e:
+        await status.edit_text(f"❌ مدل {name} کار نکرد و ذخیره نشد:\n{str(e)[:600]}\n\nاسم دیگری بفرستید یا بنویسید: cancel")
+        return
+
+    set_setting("gemini_model", name)
+    await state.clear()
+    await status.edit_text(f"✅ مدل تست شد و ذخیره شد: {name}\nاز این به بعد تصحیح‌ها با این مدل انجام می‌شود.")
+
+
+# ══════════════════════════════════════════════════════════════════
+# [SECTION 13] ادمین: پیام همگانی
+# ══════════════════════════════════════════════════════════════════
 @dp.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
     if not await require_admin(callback):
@@ -722,7 +884,10 @@ async def process_broadcast_message(message: Message, state: FSMContext):
     await show_admin_panel(message)
 
 
-# ---- ساخت آزمون ----
+# ══════════════════════════════════════════════════════════════════
+# [SECTION 14] ادمین: ساخت آزمون و سگمنت
+#   مسیر: نوع آزمون > عنوان > (زبان > صوت > راهنما) × تعداد سگمنت > پایان
+# ══════════════════════════════════════════════════════════════════
 @dp.callback_query(F.data == "admin_create_manual")
 async def admin_create_manual(callback: CallbackQuery, state: FSMContext):
     if not await require_admin(callback):
@@ -843,7 +1008,9 @@ async def admin_finish_test(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-# ---- مدیریت آزمون‌ها ----
+# ══════════════════════════════════════════════════════════════════
+# [SECTION 15] ادمین: مدیریت و حذف آزمون/سگمنت
+# ══════════════════════════════════════════════════════════════════
 async def render_manage_tests(callback: CallbackQuery):
     with db() as conn:
         tests = conn.execute("SELECT id, title, test_type FROM tests").fetchall()
@@ -866,7 +1033,9 @@ async def render_manage_tests(callback: CallbackQuery):
 async def render_manage_single_test(callback: CallbackQuery, test_id: int):
     with db() as conn:
         test_row = conn.execute("SELECT title FROM tests WHERE id = ?", (test_id,)).fetchone()
-        segments = conn.execute("SELECT id, segment_index, segment_lang FROM segments WHERE test_id = ? ORDER BY segment_index", (test_id,)).fetchall()
+        segments = conn.execute(
+            "SELECT id, segment_index, segment_lang FROM segments WHERE test_id = ? ORDER BY segment_index", (test_id,)
+        ).fetchall()
 
     if not test_row:
         await render_manage_tests(callback)
@@ -932,15 +1101,9 @@ async def admin_delete_segment(callback: CallbackQuery):
     await render_manage_single_test(callback, test_id)
 
 
-@dp.callback_query(F.data == "admin_back_to_main")
-async def admin_back_to_main(callback: CallbackQuery):
-    if not await require_admin(callback):
-        return
-    await show_admin_panel(callback.message)
-    await callback.answer()
-
-
-# ---- نتایج ----
+# ══════════════════════════════════════════════════════════════════
+# [SECTION 16] ادمین: مشاهده نتایج و پاکسازی دیتابیس
+# ══════════════════════════════════════════════════════════════════
 @dp.callback_query(F.data == "admin_view_results")
 async def admin_view_results(callback: CallbackQuery):
     if not await require_admin(callback):
@@ -955,7 +1118,6 @@ async def admin_view_results(callback: CallbackQuery):
     await callback.answer()
 
 
-# ---- پاکسازی دیتابیس (با تایید) ----
 @dp.callback_query(F.data == "admin_clear_db")
 async def admin_clear_db(callback: CallbackQuery):
     if not await require_admin(callback):
@@ -983,13 +1145,14 @@ async def admin_clear_db_confirm(callback: CallbackQuery):
     await callback.answer()
 
 
-# ============================================================
-# اجرا
-# ============================================================
+# ══════════════════════════════════════════════════════════════════
+# [SECTION 17] نقطه شروع برنامه
+# ══════════════════════════════════════════════════════════════════
 async def main():
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logging.info("Flask web server started.")
+    logging.info(f"Gemini model in use: {get_model()}")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
