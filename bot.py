@@ -497,9 +497,7 @@ async def cmd_start_or_menu(message: Message, state: FSMContext):
     await message.answer(
         "سلام! به بخش آزمون‌های ترجمه شفاهی خوش آمدید.\n\nلطفاً یکی از آزمون‌های زیر را انتخاب کنید:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-    )
-    await message.answer("👇 منوی دسترسی سریع:", reply_markup=get_main_reply_keyboard())
-
+   
 
 @dp.callback_query(F.data.startswith("start_test_"))
 async def user_start_test(callback: CallbackQuery, state: FSMContext):
