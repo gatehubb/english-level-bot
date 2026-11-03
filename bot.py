@@ -15,7 +15,7 @@
  [SECTION 7]  ابزارهای کمکی تلگرام (کیبورد، ارسال پیام بلند، بررسی ادمین)
  [SECTION 8]  سرویس تصحیح هوش مصنوعی (Gemini)
  [SECTION 9]  بخش کاربر: /start، لیست آزمون‌ها، برگزاری آزمون
- [SECTION 10] کارنامه: تایید / ارسال سفارشی / رد
+ [SECTION 10] مرکز کارنامه: دکمه‌های «تصحیح با هوش مصنوعی» و «بررسی دستی»، تایید / سفارشی / رد
  [SECTION 11] ادمین: ورود با رمز و پنل اصلی
  [SECTION 12] ادمین: ویرایش پرامپت و تغییر مدل Gemini
  [SECTION 13] ادمین: پیام همگانی
@@ -66,6 +66,9 @@ DEFAULT_GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_TIMEOUT = int(os.environ.get("GEMINI_TIMEOUT", "180"))  # ثانیه برای هر درخواست
 DB_PATH = os.environ.get("DB_PATH", "bot_database.db")
 
+# افکت شمارش معکوس قبل از پخش هر سگمنت (برای خاموش کردن: COUNTDOWN_ENABLED=0)
+COUNTDOWN_ENABLED = os.environ.get("COUNTDOWN_ENABLED", "1") == "1"
+
 CHANNEL_USERNAME = "@Free_naati"
 CHANNEL_LINK = "https://t.me/Free_naati"
 
@@ -84,7 +87,11 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 gemini = genai.Client(api_key=GEMINI_API_KEY)
 
-background_tasks = set()  # نگه‌داری رفرنس تسک‌های پس‌زمینه (تا garbage collect نشوند)
+background_tasks = set()      # نگه‌داری رفرنس تسک‌های پس‌زمینه (تا garbage collect نشوند)
+grading_in_progress = set()   # شناسه‌ی آزمون‌هایی که همین الان در حال تصحیح با هوش مصنوعی‌اند
+
+# افکت کانفتی 🎉 تلگرام (message effect) برای پیام پایان آزمون. فقط در چت خصوصی کار می‌کند.
+CONFETTI_EFFECT_ID = "5046509860389126442"
 
 DEFAULT_PROMPT = """You are an expert NAATI CCL / interpreting examiner.
 You will receive, for each segment: (1) the ORIGINAL audio the candidate had to interpret, and (2) the CANDIDATE's spoken interpretation.
@@ -137,10 +144,19 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS results (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, test_title TEXT, analysis TEXT, date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS pending_reports (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, test_title TEXT, report TEXT)")
+        # آزمون‌های انجام‌شده توسط کاربران (تا ادمین هر وقت خواست تصحیح کند) + نسخه‌ی کپی اطلاعات سگمنت‌ها
+        c.execute("CREATE TABLE IF NOT EXISTS submissions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, user_label TEXT, test_id INTEGER, test_title TEXT, test_type TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        c.execute("CREATE TABLE IF NOT EXISTS submission_items (id INTEGER PRIMARY KEY AUTOINCREMENT, submission_id INTEGER, segment_index INTEGER, voice_file_id TEXT, seg_file_id TEXT, seg_lang TEXT, seg_mime TEXT, seg_key TEXT)")
 
         # مهاجرت: ستون نوع فایل صوتی سگمنت
         try:
             c.execute("ALTER TABLE segments ADD COLUMN file_mime TEXT")
+        except sqlite3.OperationalError:
+            pass
+
+        # مهاجرت: ستون کلید تصحیح هر سگمنت
+        try:
+            c.execute("ALTER TABLE segments ADD COLUMN answer_key TEXT")
         except sqlite3.OperationalError:
             pass
 
@@ -200,6 +216,7 @@ class AdminStates(StatesGroup):
     waiting_for_segment_lang = State()
     waiting_for_segment_audio = State()
     waiting_for_segment_tip = State()
+    waiting_for_segment_key = State()
     waiting_for_broadcast_message = State()
     waiting_for_custom_report = State()
     waiting_for_prompt = State()
@@ -233,6 +250,47 @@ async def send_long(chat_id, text, reply_markup=None):
     chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)] or [" "]
     for i, chunk in enumerate(chunks):
         await bot.send_message(chat_id, chunk, reply_markup=reply_markup if i == len(chunks) - 1 else None)
+
+
+async def play_countdown(message: Message):
+    """افکت شمارش معکوس: یک پیام که با ویرایش، ۳ ← ۲ ← ۱ ← حرکت می‌شود و بعد پاک می‌شود."""
+    if not COUNTDOWN_ENABLED:
+        return
+    frames = ["3️⃣ ...", "2️⃣ حاضری؟", "1️⃣ آماده ...", "🚀 حرکت!"]
+    try:
+        msg = await message.answer(frames[0])
+        for frame in frames[1:]:
+            await asyncio.sleep(1)
+            await msg.edit_text(frame)
+        await asyncio.sleep(0.7)
+        await msg.delete()
+    except Exception as err:
+        logging.warning(f"countdown effect failed: {err}")
+
+
+FINISH_TEXT = (
+    "🎉 تبریک! آزمون شما به پایان رسید.\n\n"
+    "✅ پاسخ‌های شما با موفقیت ثبت شد.\n"
+    "🤖 جواب‌های شما برای تصحیح به سیستم هوش مصنوعی و استاد ارسال شد.\n"
+    "⏳ بعد از بررسی و تایید، کارنامه‌تان تا چند ساعت آینده برای شما ارسال می‌شود.\n\n"
+    "🙏 لطفاً تا آن زمان ربات را متوقف (Stop) نکنید."
+)
+
+
+async def send_finish_message(message: Message):
+    """پیام پایان آزمون همراه با افکت کانفتی تلگرام؛ اگر افکت پشتیبانی نشد، پیام ساده می‌رود."""
+    try:
+        await message.answer(FINISH_TEXT, reply_markup=get_main_reply_keyboard(), message_effect_id=CONFETTI_EFFECT_ID)
+    except Exception as err:
+        logging.warning(f"message effect failed, sending plain message: {err}")
+        await message.answer(FINISH_TEXT, reply_markup=get_main_reply_keyboard())
+
+
+def user_label(user):
+    """نام نمایشی کاربر: @username اگر داشت، وگرنه نام کامل."""
+    if user.username:
+        return f"@{user.username}"
+    return user.full_name or f"id:{user.id}"
 
 
 def is_admin_user(user_id):
@@ -292,30 +350,49 @@ async def list_gemini_models():
     return names
 
 
-async def grade_with_gemini(test_title, test_type, segments, user_voices):
+def load_submission(sid):
+    """خواندن آزمون ذخیره‌شده‌ی کاربر: (اطلاعات کلی، لیست سگمنت‌ها)"""
+    with db() as conn:
+        sub = conn.execute(
+            "SELECT id, user_id, user_label, test_title, test_type FROM submissions WHERE id = ?", (sid,)
+        ).fetchone()
+        items = conn.execute(
+            "SELECT segment_index, voice_file_id, seg_file_id, seg_lang, seg_mime, seg_key "
+            "FROM submission_items WHERE submission_id = ? ORDER BY segment_index",
+            (sid,),
+        ).fetchall()
+    return sub, items
+
+
+async def grade_with_gemini(test_title, test_type, items):
     system_prompt = get_prompt()
     notes = []
 
-    for i, seg in enumerate(segments):
-        direction = "English to Persian" if seg[2] == "en" else "Persian to English"
-        src_mime = seg[4] if len(seg) > 4 and seg[4] else "audio/ogg"
-        src_bytes = await download_bytes(seg[1])
-        usr_bytes = await download_bytes(user_voices[i]["voice_file_id"])
+    for it in items:
+        idx, voice_id, seg_file_id, seg_lang, seg_mime, seg_key = it
+        direction = "English to Persian" if seg_lang == "en" else "Persian to English"
+        src_bytes = await download_bytes(seg_file_id)
+        usr_bytes = await download_bytes(voice_id)
 
         parts = [
-            types.Part.from_text(text=f"Test: {test_title} ({test_type}). Now evaluate ONLY segment {i + 1} ({direction})."),
+            types.Part.from_text(text=f"Test: {test_title} ({test_type}). Now evaluate ONLY segment {idx} ({direction})."),
             types.Part.from_text(text="ORIGINAL audio:"),
-            types.Part.from_bytes(data=src_bytes, mime_type=src_mime),
+            types.Part.from_bytes(data=src_bytes, mime_type=seg_mime or "audio/ogg"),
             types.Part.from_text(text="CANDIDATE's spoken interpretation:"),
             types.Part.from_bytes(data=usr_bytes, mime_type="audio/ogg"),
-            types.Part.from_text(text=(
-                "Write detailed examiner notes in Persian for this segment only: accuracy (omissions, additions, "
-                "numbers, names), language quality, delivery (pronunciation, fluency, hesitations, fillers, pauses, tone), "
-                "concrete examples of errors, and a score for this segment. Base everything only on what you hear."
-            )),
         ]
+        if seg_key:
+            parts.append(types.Part.from_text(text=(
+                "Reference correction key written by the human examiner for this segment "
+                "(treat it as the ground truth for accuracy and key points):\n" + seg_key
+            )))
+        parts.append(types.Part.from_text(text=(
+            "Write detailed examiner notes in Persian for this segment only: accuracy (omissions, additions, "
+            "numbers, names), language quality, delivery (pronunciation, fluency, hesitations, fillers, pauses, tone), "
+            "concrete examples of errors, and a score for this segment. Base everything only on what you hear."
+        )))
         note = await gemini_call(parts, system_prompt=system_prompt)
-        notes.append(f"=== Segment {i + 1} ({direction}) ===\n{note or '(no output)'}")
+        notes.append(f"=== Segment {idx} ({direction}) ===\n{note or '(no output)'}")
 
     final_contents = [
         f"Test: {test_title} ({test_type}).",
@@ -323,37 +400,44 @@ async def grade_with_gemini(test_title, test_type, segments, user_voices):
         "\n\n".join(notes),
         "Now write the FINAL complete report for the candidate, following exactly the instructions and format in your system prompt.",
     ]
-    report = await gemini_call(final_contents, system_prompt=system_prompt)
-    return report
+    return await gemini_call(final_contents, system_prompt=system_prompt)
 
 
-async def grade_and_notify(admin_ids, user_id, username, test_title, test_type, segments, user_voices):
-    """در پس‌زمینه اجرا می‌شود: تصحیح با Gemini و ارسال کارنامه‌ی پیشنهادی به ادمین."""
+async def run_ai_grading(sid, admin_chat_id):
+    """
+    با زدن دکمه‌ی «دریافت تصحیح از هوش مصنوعی» اجرا می‌شود:
+    تصحیح با Gemini > ارسال کارنامه‌ی پیشنهادی (با دکمه‌های تایید/ویرایش/رد) > ارسال ویس‌های کاربر در پایین آن.
+    """
+    sub, items = load_submission(sid)
+    if not sub:
+        await bot.send_message(admin_chat_id, "⚠️ این آزمون در دیتابیس پیدا نشد (شاید دیتابیس پاک شده است).")
+        return
+    _, user_id, label, test_title, test_type = sub
+
+    status = await bot.send_message(admin_chat_id, f"⏳ در حال تصحیح آزمون {label} با هوش مصنوعی...\n(بسته به تعداد سگمنت‌ها ممکن است چند دقیقه طول بکشد)")
+
     try:
-        report = await grade_with_gemini(test_title, test_type, segments, user_voices)
+        report = await grade_with_gemini(test_title, test_type, items)
         if not report:
             raise RuntimeError("Gemini returned an empty response")
     except Exception as err:
         logging.error(f"Gemini grading failed: {err}")
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✏️ ارسال کارنامه سفارشی", callback_data=f"custom_rep_{user_id}")
-        ]])
-        for admin_id in admin_ids:
-            try:
-                await bot.send_message(
-                    admin_id,
-                    f"⚠️ تصحیح خودکار برای @{username} ناموفق بود:\n{str(err)[:800]}\n\nخودتان با دکمه زیر کارنامه بفرستید.",
-                    reply_markup=kb,
-                )
-            except Exception as e2:
-                logging.error(f"notify admin {admin_id}: {e2}")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 تلاش مجدد با هوش مصنوعی", callback_data=f"sub_ai_{sid}")],
+            [InlineKeyboardButton(text="🎧 بررسی دستی", callback_data=f"sub_manual_{sid}")],
+        ])
+        await status.edit_text(
+            f"⚠️ تصحیح خودکار ناموفق بود:\n{str(err)[:800]}\n\n"
+            "اگر خطا درباره‌ی مدل است، از پنل ادمین > «تغییر مدل Gemini» مدل را عوض کنید.",
+            reply_markup=kb,
+        )
         return
 
     with db() as conn:
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO pending_reports (user_id, username, test_title, report) VALUES (?, ?, ?, ?)",
-            (user_id, username, test_title, report),
+            (user_id, label, test_title, report),
         )
         pid = cur.lastrowid
         conn.commit()
@@ -363,15 +447,23 @@ async def grade_and_notify(admin_ids, user_id, username, test_title, test_type, 
         [InlineKeyboardButton(text="✏️ ارسال متن سفارشی (ویرایش‌شده)", callback_data=f"custom_rep_{user_id}")],
         [InlineKeyboardButton(text="❌ رد کردن", callback_data=f"reject_{user_id}")],
     ])
-    for admin_id in admin_ids:
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    await send_long(
+        admin_chat_id,
+        f"🤖 کارنامه پیشنهادی هوش مصنوعی\n👤 {label} (id: {user_id})\n📚 {test_title}\n\n{report}",
+        reply_markup=kb,
+    )
+
+    # ویس‌های کاربر زیر کارنامه
+    for it in items:
         try:
-            await send_long(
-                admin_id,
-                f"🤖 کارنامه پیشنهادی هوش مصنوعی\n👤 @{username} (id: {user_id})\n📚 {test_title}\n\n{report}",
-                reply_markup=kb,
-            )
+            await bot.send_voice(admin_chat_id, voice=it[1], caption=f"🎙 ویس سگمنت {it[0]} - {label}")
+            await asyncio.sleep(0.3)
         except Exception as err:
-            logging.error(f"send report to admin {admin_id}: {err}")
+            logging.error(f"send voice to admin {admin_chat_id}: {err}")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -416,7 +508,7 @@ async def user_start_test(callback: CallbackQuery, state: FSMContext):
     with db() as conn:
         test_row = conn.execute("SELECT title, test_type FROM tests WHERE id = ?", (test_id,)).fetchone()
         segments = conn.execute(
-            "SELECT id, file_id, segment_lang, segment_tip, file_mime FROM segments WHERE test_id = ? ORDER BY segment_index ASC",
+            "SELECT id, file_id, segment_lang, segment_tip, file_mime, answer_key FROM segments WHERE test_id = ? ORDER BY segment_index ASC",
             (test_id,),
         ).fetchall()
 
@@ -479,6 +571,9 @@ async def ack_tip_and_play(callback: CallbackQuery, state: FSMContext):
         except Exception:
             pass
 
+    await callback.answer()  # زودتر جواب بده تا دکمه در حال بارگذاری نماند
+    await play_countdown(callback.message)  # افکت ۳-۲-۱-حرکت
+
     lang_dir = "انگلیسی به فارسی 🇬🇧 ➡️ 🇮🇷" if seg[2] == "en" else "فارسی به انگلیسی 🇮🇷 ➡️ 🇬🇧"
 
     info_msg = await callback.message.answer(
@@ -494,7 +589,6 @@ async def ack_tip_and_play(callback: CallbackQuery, state: FSMContext):
             audio_msg = await callback.message.answer_document(document=seg[1])
 
     await state.update_data(last_info_msg_id=info_msg.message_id, last_audio_msg_id=audio_msg.message_id)
-    await callback.answer()
 
 
 @dp.message(UserTestStates.taking_test, F.voice)
@@ -522,36 +616,53 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
         return
 
     # ---- آخرین سگمنت: پایان آزمون ----
+    test_id = data.get("test_id")
     test_title = data.get("test_title")
     test_type = data.get("test_type")
     user_id = message.from_user.id
-    username = message.from_user.username or message.from_user.full_name
+    label = user_label(message.from_user)
 
-    await message.answer(
-        "✅ آزمون شما به پایان رسید.\n\n"
-        "جواب‌های شما به سیستم تصحیح توسط هوش مصنوعی و استاد ارسال شد و بعد از تایید تا چند ساعت آینده برای شما ارسال خواهد شد. "
-        "لطفا تا آن زمان ربات را متوقف نکنید.",
-        reply_markup=get_main_reply_keyboard(),
-    )
-
+    # ذخیره‌ی آزمون کاربر در دیتابیس (تصحیح بعداً با دکمه‌ی ادمین انجام می‌شود)
     with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO submissions (user_id, user_label, test_id, test_title, test_type) VALUES (?, ?, ?, ?, ?)",
+            (user_id, label, test_id, test_title, test_type),
+        )
+        sid = cur.lastrowid
+        for i, seg in enumerate(segments):
+            cur.execute(
+                "INSERT INTO submission_items (submission_id, segment_index, voice_file_id, seg_file_id, seg_lang, seg_mime, seg_key) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (sid, user_voices[i]["segment_index"], user_voices[i]["voice_file_id"],
+                 seg[1], seg[2], seg[4] if len(seg) > 4 else None, seg[5] if len(seg) > 5 else None),
+            )
+        conn.commit()
         admin_ids = [r[0] for r in conn.execute("SELECT user_id FROM admins WHERE is_admin = 1 AND is_blocked = 0").fetchall()]
 
-    # ویس‌های کاربر برای شنیدن مستقیم توسط ادمین
+    # 🎉 پیام پایان آزمون با افکت کانفتی
+    await send_finish_message(message)
+
+    # اعلان به ادمین‌ها با دو دکمه
+    admin_text = (
+        "📥 آزمون جدیدی انجام شده است\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"📚 آزمون: {test_title}\n"
+        f"👤 کاربر: {label}\n"
+        f"🆔 شناسه: {user_id}\n"
+        f"🎙 تعداد پاسخ‌ها: {len(segments)}\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "یکی از روش‌های بررسی را انتخاب کنید 👇"
+    )
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🤖 دریافت تصحیح از هوش مصنوعی", callback_data=f"sub_ai_{sid}")],
+        [InlineKeyboardButton(text="🎧 بررسی دستی", callback_data=f"sub_manual_{sid}")],
+    ])
     for admin_id in admin_ids:
         try:
-            await bot.send_message(admin_id, f"📥 آزمون جدید از @{username} ({test_title}) دریافت شد. تصحیح هوش مصنوعی در حال انجام است...")
-            for item in user_voices:
-                await bot.send_voice(admin_id, voice=item["voice_file_id"], caption=f"ویس سگمنت {item['segment_index']} - @{username}")
+            await bot.send_message(admin_id, admin_text, reply_markup=admin_kb)
         except Exception as err:
-            logging.error(f"Failed to send voices to admin {admin_id}: {err}")
-
-    # تصحیح در پس‌زمینه تا ربات برای بقیه کاربران قفل نشود
-    task = asyncio.create_task(
-        grade_and_notify(admin_ids, user_id, username, test_title, test_type, segments, user_voices)
-    )
-    background_tasks.add(task)
-    task.add_done_callback(background_tasks.discard)
+            logging.error(f"Failed to notify admin {admin_id}: {err}")
 
     await state.clear()
 
@@ -564,6 +675,68 @@ async def remind_send_voice(message: Message):
 # ══════════════════════════════════════════════════════════════════
 # [SECTION 10] کارنامه: تایید / ارسال سفارشی / رد
 # ══════════════════════════════════════════════════════════════════
+@dp.callback_query(F.data.startswith("sub_ai_"))
+async def admin_sub_ai(callback: CallbackQuery):
+    """دکمه‌ی «دریافت تصحیح از هوش مصنوعی»"""
+    if not await require_admin(callback):
+        return
+    sid = int(callback.data.split("_")[2])
+    if sid in grading_in_progress:
+        await callback.answer("⏳ تصحیح این آزمون همین الان در حال انجام است...", show_alert=True)
+        return
+    await callback.answer("درخواست برای هوش مصنوعی ارسال شد ⏳")
+    grading_in_progress.add(sid)
+
+    async def _job():
+        try:
+            await run_ai_grading(sid, callback.from_user.id)
+        except Exception as err:
+            logging.error(f"run_ai_grading crashed: {err}")
+            try:
+                await bot.send_message(callback.from_user.id, f"❌ خطای غیرمنتظره: {str(err)[:500]}")
+            except Exception:
+                pass
+        finally:
+            grading_in_progress.discard(sid)
+
+    task = asyncio.create_task(_job())
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+
+@dp.callback_query(F.data.startswith("sub_manual_"))
+async def admin_sub_manual(callback: CallbackQuery):
+    """دکمه‌ی «بررسی دستی»: ویس‌های کاربر یکی‌یکی، و بعد از هر ویس «کلید تصحیح» همان سگمنت."""
+    if not await require_admin(callback):
+        return
+    sid = int(callback.data.split("_")[2])
+    sub, items = load_submission(sid)
+    if not sub:
+        await callback.answer("این آزمون در دیتابیس پیدا نشد.", show_alert=True)
+        return
+    await callback.answer()
+    _, user_id, label, test_title, test_type = sub
+    chat_id = callback.from_user.id
+
+    await bot.send_message(chat_id, f"🎧 بررسی دستی\n📚 {test_title}\n👤 {label}\n\nبعد از هر ویس، کلید تصحیح همان سگمنت می‌آید 👇")
+    for it in items:
+        idx, voice_id, _sf, _lang, _mime, key = it
+        try:
+            await bot.send_voice(chat_id, voice=voice_id, caption=f"🎙 ویس سگمنت {idx} - {label}")
+        except Exception as err:
+            await bot.send_message(chat_id, f"⚠️ ارسال ویس سگمنت {idx} ناموفق بود: {err}")
+        if key:
+            await send_long(chat_id, f"🔑 کلید تصحیح سگمنت {idx}:\n{key}")
+        else:
+            await bot.send_message(chat_id, f"🔑 برای سگمنت {idx} کلید تصحیحی ثبت نشده است.")
+        await asyncio.sleep(0.3)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✏️ ارسال کارنامه برای کاربر", callback_data=f"custom_rep_{user_id}")
+    ]])
+    await bot.send_message(chat_id, "✅ همه‌ی ویس‌ها ارسال شد. بعد از بررسی، کارنامه را با دکمه‌ی زیر برای کاربر بفرستید:", reply_markup=kb)
+
+
 @dp.callback_query(F.data.startswith("approve_"))
 async def admin_approve_report(callback: CallbackQuery):
     if not await require_admin(callback):
@@ -961,18 +1134,31 @@ async def process_segment_audio(message: Message, state: FSMContext):
 
 @dp.message(AdminStates.waiting_for_segment_tip, F.text)
 async def process_segment_tip(message: Message, state: FSMContext):
+    await state.update_data(segment_tip=message.text)
+    await message.answer(
+        "🔑 حالا «کلید تصحیح» این سگمنت را بفرستید.\n\n"
+        "مثلاً ترجمه‌ی درست، اعداد و نکات کلیدی که باید در جواب کاربر باشد. "
+        "این متن فقط برای شما نمایش داده می‌شود (در بررسی دستی، زیر ویس کاربر) و به هوش مصنوعی هم به‌عنوان مرجع داده می‌شود.\n\n"
+        "اگر کلیدی ندارید بنویسید: -"
+    )
+    await state.set_state(AdminStates.waiting_for_segment_key)
+
+
+@dp.message(AdminStates.waiting_for_segment_key, F.text)
+async def process_segment_key(message: Message, state: FSMContext):
     data = await state.get_data()
     test_id = data.get("test_id")
     file_id = data.get("file_id")
     file_mime = data.get("file_mime")
-    segment_tip = message.text
+    segment_tip = data.get("segment_tip")
     seg_index = data.get("segment_index")
     segment_lang = data.get("segment_lang")
+    answer_key = None if message.text.strip() == "-" else message.text
 
     with db() as conn:
         conn.execute(
-            "INSERT INTO segments (test_id, file_id, segment_index, segment_lang, segment_tip, file_mime) VALUES (?, ?, ?, ?, ?, ?)",
-            (test_id, file_id, seg_index, segment_lang, segment_tip, file_mime),
+            "INSERT INTO segments (test_id, file_id, segment_index, segment_lang, segment_tip, file_mime, answer_key) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (test_id, file_id, seg_index, segment_lang, segment_tip, file_mime, answer_key),
         )
         conn.commit()
 
@@ -1137,6 +1323,8 @@ async def admin_clear_db_confirm(callback: CallbackQuery):
     with db() as conn:
         conn.execute("DELETE FROM results")
         conn.execute("DELETE FROM pending_reports")
+        conn.execute("DELETE FROM submission_items")
+        conn.execute("DELETE FROM submissions")
         conn.execute("DELETE FROM segments")
         conn.execute("DELETE FROM tests")
         conn.execute("DELETE FROM users")
