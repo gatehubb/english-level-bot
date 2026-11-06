@@ -47,6 +47,7 @@ from aiogram.types import (
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramBadRequest
 
 from google import genai
 from google.genai import types
@@ -220,7 +221,6 @@ class AdminStates(StatesGroup):
     waiting_for_broadcast_message = State()
     waiting_for_custom_report = State()
     waiting_for_prompt = State()
-    waiting_for_model = State()
 
 
 class UserTestStates(StatesGroup):
@@ -231,11 +231,124 @@ class UserTestStates(StatesGroup):
 # ══════════════════════════════════════════════════════════════════
 # [SECTION 7] ابزارهای کمکی تلگرام
 # ══════════════════════════════════════════════════════════════════
-def get_main_reply_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="🚀 شروع آزمون"), KeyboardButton(text="🔙 منوی قبل")]],
-        resize_keyboard=True,
-    )
+# ---------- سیستم ناوبری (منوی قبل / منوی اصلی) ----------
+# برای هر چت یک «پشته‌ی منو» نگه می‌داریم: [منوی اصلی, پنل مدیریت, مدیریت آزمون‌ها, ...]
+# بالاترین عنصر = جایی که کاربر الان هست؛ عنصر زیرش = «منوی قبل».
+# هم دکمه‌های شیشه‌ای زیر پیام‌ها و هم کیبورد ثابت پایین چت از همین پشته ساخته می‌شوند.
+BTN_START = "🚀 شروع آزمون"
+BTN_HOME = "🏠 منوی اصلی"
+BTN_EXAM_HOME = "🏠 منوی اصلی (انصراف از آزمون)"
+BTN_BACK = "🔙 "          # متن دکمه‌ی بازگشت = "🔙 " + اسم منوی قبل
+
+nav_stacks = {}           # chat_id -> [(key, label), ...]
+last_kb_sig = {}          # chat_id -> آخرین کیبورد پایین چت که برایش فرستاده‌ایم
+
+
+def nav_reset(chat_id):
+    nav_stacks[chat_id] = [("main", "منوی اصلی")]
+
+
+def nav_stack(chat_id):
+    if chat_id not in nav_stacks:
+        nav_reset(chat_id)
+    return nav_stacks[chat_id]
+
+
+def nav_enter(chat_id, key, label):
+    """ورود به یک منو. اگر قبلاً در پشته بود، پشته تا همان‌جا برمی‌گردد (حلقه نمی‌سازد)."""
+    st = nav_stack(chat_id)
+    for i, (k, _) in enumerate(st):
+        if k == key:
+            del st[i + 1:]
+            return
+    st.append((key, label))
+
+
+def nav_back(chat_id):
+    st = nav_stack(chat_id)
+    if len(st) > 1:
+        st.pop()
+    return st[-1][0]
+
+
+def nav_row(chat_id):
+    """ردیف دکمه‌های شیشه‌ای «بازگشت به منوی قبل» + «منوی اصلی». در منوی اصلی چیزی نمی‌دهد."""
+    st = nav_stack(chat_id)
+    if len(st) <= 1:
+        return []
+    home = InlineKeyboardButton(text=BTN_HOME, callback_data="nav_home")
+    if len(st) == 2:  # منوی قبل همان منوی اصلی است، دو دکمه‌ی تکراری نمی‌گذاریم
+        return [[home]]
+    return [[InlineKeyboardButton(text=f"{BTN_BACK}{st[-2][1]}", callback_data="nav_back"), home]]
+
+
+def with_nav(chat_id, rows=None):
+    """کیبورد شیشه‌ای زیر پیام: دکمه‌های خود پیام + ردیف ناوبری."""
+    all_rows = list(rows or []) + nav_row(chat_id)
+    return InlineKeyboardMarkup(inline_keyboard=all_rows) if all_rows else None
+
+
+def build_reply_kb(chat_id):
+    """کیبورد ثابت پایین چت، کاملاً وابسته به موقعیت فعلی کاربر."""
+    st = nav_stack(chat_id)
+    if len(st) <= 1:
+        rows = [[KeyboardButton(text=BTN_START)]]
+    elif st[-1][0] == "exam":
+        rows = [[KeyboardButton(text=BTN_EXAM_HOME)]]
+    elif len(st) == 2:
+        rows = [[KeyboardButton(text=BTN_HOME)]]
+    else:
+        rows = [[KeyboardButton(text=f"{BTN_BACK}{st[-2][1]}"), KeyboardButton(text=BTN_HOME)]]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def _kb_sig(kb):
+    return tuple(b.text for row in kb.keyboard for b in row)
+
+
+def attach_reply_kb(chat_id):
+    """وقتی خودمان کیبورد را به یک پیام وصل می‌کنیم."""
+    kb = build_reply_kb(chat_id)
+    last_kb_sig[chat_id] = _kb_sig(kb)
+    return kb
+
+
+def get_main_reply_keyboard(chat_id):
+    """کاربر را به منوی اصلی برمی‌گرداند و کیبورد اصلی را برمی‌گرداند."""
+    nav_reset(chat_id)
+    return attach_reply_kb(chat_id)
+
+
+async def refresh_reply_kb(chat_id):
+    """
+    کیبورد پایین چت را با موقعیت فعلی هماهنگ می‌کند (فقط اگر تغییر کرده باشد).
+    تلگرام کیبورد پایین را فقط همراه یک پیام می‌پذیرد؛ پس یک پیام کوتاه می‌فرستیم
+    و بلافاصله پاک می‌کنیم. کیبورد می‌ماند و متنی در چت باقی نمی‌ماند.
+    """
+    kb = build_reply_kb(chat_id)
+    sig = _kb_sig(kb)
+    if last_kb_sig.get(chat_id) == sig:
+        return
+    last_kb_sig[chat_id] = sig
+    try:
+        helper = await bot.send_message(chat_id, "👇", reply_markup=kb)
+        await helper.delete()
+    except Exception as err:
+        logging.warning(f"reply keyboard refresh failed: {err}")
+
+
+async def show_screen(message: Message, text, kb=None, edit=False):
+    """نمایش یک صفحه: ویرایش پیام فعلی (edit=True) یا ارسال پیام جدید."""
+    if edit:
+        try:
+            await message.edit_text(text, reply_markup=kb)
+            return
+        except TelegramBadRequest as err:
+            if "not modified" in str(err).lower():
+                return
+        except Exception:
+            pass
+    await message.answer(text, reply_markup=kb)
 
 
 async def download_bytes(file_id):
@@ -280,10 +393,10 @@ FINISH_TEXT = (
 async def send_finish_message(message: Message):
     """پیام پایان آزمون همراه با افکت کانفتی تلگرام؛ اگر افکت پشتیبانی نشد، پیام ساده می‌رود."""
     try:
-        await message.answer(FINISH_TEXT, reply_markup=get_main_reply_keyboard(), message_effect_id=CONFETTI_EFFECT_ID)
+        await message.answer(FINISH_TEXT, reply_markup=get_main_reply_keyboard(message.chat.id), message_effect_id=CONFETTI_EFFECT_ID)
     except Exception as err:
         logging.warning(f"message effect failed, sending plain message: {err}")
-        await message.answer(FINISH_TEXT, reply_markup=get_main_reply_keyboard())
+        await message.answer(FINISH_TEXT, reply_markup=get_main_reply_keyboard(message.chat.id))
 
 
 def user_label(user):
@@ -469,8 +582,47 @@ async def run_ai_grading(sid, admin_chat_id):
 # ══════════════════════════════════════════════════════════════════
 # [SECTION 9] بخش کاربر: /start، لیست آزمون‌ها، برگزاری آزمون
 # ══════════════════════════════════════════════════════════════════
-@dp.message(F.text.in_(["/start", "🚀 شروع آزمون", "🔙 منوی قبل"]))
+async def show_main_menu(message: Message, edit=False):
+    """منوی اصلی کاربر: لیست آزمون‌ها."""
+    chat_id = message.chat.id
+    with db() as conn:
+        tests = conn.execute("SELECT id, title, test_type FROM tests").fetchall()
+
+    if not tests:
+        await show_screen(message, "سلام! در حال حاضر هیچ آزمونی فعال نشده است.", None, edit)
+    else:
+        buttons = []
+        for t_id, t_title, t_type in tests:
+            type_label = "🎯 تعیین سطح" if t_type == "placement" else "📝 ماک کامل"
+            buttons.append([InlineKeyboardButton(text=f"{type_label}: {t_title}", callback_data=f"start_test_{t_id}")])
+        await show_screen(
+            message,
+            "سلام! به بخش آزمون‌های ترجمه شفاهی خوش آمدید.\n\nلطفاً یکی از آزمون‌های زیر را انتخاب کنید:",
+            InlineKeyboardMarkup(inline_keyboard=buttons),
+            edit,
+        )
+    await refresh_reply_kb(chat_id)
+
+
+async def render_screen(key, message: Message, edit=False):
+    """نمایش منویی که با کلیدش مشخص شده (برای دکمه‌های بازگشت)."""
+    chat_id = message.chat.id
+    if key.startswith("admin") and not is_admin_user(chat_id):
+        nav_reset(chat_id)
+        key = "main"
+    if key == "admin":
+        await show_admin_panel(message, edit)
+    elif key == "admin_tests":
+        await render_manage_tests(message, edit)
+    elif key.startswith("admin_test:"):
+        await render_manage_single_test(message, int(key.split(":")[1]), edit)
+    else:
+        await show_main_menu(message, edit)
+
+
+@dp.message(F.text.in_(["/start", BTN_START]) | F.text.startswith(BTN_HOME))
 async def cmd_start_or_menu(message: Message, state: FSMContext):
+    """/start، «شروع آزمون» و «منوی اصلی»: همیشه به منوی اصلی می‌رود."""
     await state.clear()
     user_id = message.from_user.id
     username = message.from_user.username or ""
@@ -479,25 +631,40 @@ async def cmd_start_or_menu(message: Message, state: FSMContext):
         conn.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, username))
         admin_row = conn.execute("SELECT is_blocked FROM admins WHERE user_id = ?", (user_id,)).fetchone()
         conn.commit()
-        tests = conn.execute("SELECT id, title, test_type FROM tests").fetchall()
 
     if admin_row and admin_row[0] == 1:
         await message.answer("❌ دسترسی شما مسدود شده است.")
         return
 
-    if not tests:
-        await message.answer("سلام! در حال حاضر هیچ آزمونی فعال نشده است.", reply_markup=get_main_reply_keyboard())
-        return
+    nav_reset(message.chat.id)
+    await show_main_menu(message)
 
-    buttons = []
-    for t_id, t_title, t_type in tests:
-        type_label = "🎯 تعیین سطح" if t_type == "placement" else "📝 ماک کامل"
-        buttons.append([InlineKeyboardButton(text=f"{type_label}: {t_title}", callback_data=f"start_test_{t_id}")])
 
-    await message.answer(
-        "سلام! به بخش آزمون‌های ترجمه شفاهی خوش آمدید.\n\nلطفاً یکی از آزمون‌های زیر را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-   
+@dp.message(F.text.startswith(BTN_BACK))
+async def cmd_back(message: Message, state: FSMContext):
+    """دکمه‌ی ثابت پایین چت: «🔙 <اسم منوی قبل>»."""
+    await state.clear()
+    key = nav_back(message.chat.id)
+    await render_screen(key, message, edit=False)
+
+
+@dp.callback_query(F.data == "nav_back")
+async def cb_nav_back(callback: CallbackQuery, state: FSMContext):
+    """دکمه‌ی شیشه‌ای «🔙 بازگشت به منوی قبل» زیر پیام‌ها."""
+    await state.clear()
+    key = nav_back(callback.message.chat.id)
+    await callback.answer()
+    await render_screen(key, callback.message, edit=True)
+
+
+@dp.callback_query(F.data == "nav_home")
+async def cb_nav_home(callback: CallbackQuery, state: FSMContext):
+    """دکمه‌ی شیشه‌ای «🏠 منوی اصلی»."""
+    await state.clear()
+    nav_reset(callback.message.chat.id)
+    await callback.answer()
+    await show_main_menu(callback.message, edit=True)
+
 
 @dp.callback_query(F.data.startswith("start_test_"))
 async def user_start_test(callback: CallbackQuery, state: FSMContext):
@@ -532,6 +699,8 @@ async def user_start_test(callback: CallbackQuery, state: FSMContext):
         user_voices=[],
     )
 
+    nav_enter(callback.message.chat.id, "exam", "آزمون")
+    await refresh_reply_kb(callback.message.chat.id)
     await show_segment_tip(callback.message, state)
     await callback.answer()
 
@@ -773,7 +942,13 @@ async def admin_start_custom_report(callback: CallbackQuery, state: FSMContext):
     target_user_id = int(callback.data.split("_")[2])
     await state.set_state(AdminStates.waiting_for_custom_report)
     await state.update_data(target_user_id=target_user_id)
-    await callback.message.answer("✏️ لطفاً متن کامل کارنامه، نمرات و تمرین‌ها را به صورت یک پیام متنی بفرستید تا ربات آن را برای کاربر ارسال کند:")
+    chat_id = callback.message.chat.id
+    nav_enter(chat_id, "admin_report", "ارسال کارنامه")
+    await callback.message.answer(
+        "✏️ لطفاً متن کامل کارنامه، نمرات و تمرین‌ها را به صورت یک پیام متنی بفرستید تا ربات آن را برای کاربر ارسال کند:",
+        reply_markup=with_nav(chat_id),
+    )
+    await refresh_reply_kb(chat_id)
     await callback.answer()
 
 
@@ -788,7 +963,7 @@ async def process_admin_custom_report(message: Message, state: FSMContext):
 
     try:
         await send_long(target_user_id, f"🎉 کارنامه و نتیجه آزمون شما تایید و ارسال شد:\n\n{custom_text}", reply_markup=keyboard)
-        await message.answer("✅ کارنامه سفارشی شما با موفقیت برای کاربر ارسال شد!", reply_markup=get_main_reply_keyboard())
+        await message.answer("✅ کارنامه سفارشی شما با موفقیت برای کاربر ارسال شد!", reply_markup=get_main_reply_keyboard(message.chat.id))
     except Exception as e:
         await message.answer(f"❌ خطا در ارسال به کاربر: {e}")
 
@@ -807,7 +982,7 @@ async def admin_reject_report(callback: CallbackQuery):
             await bot.send_message(
                 chat_id=target_user_id,
                 text="❌ متأسفانه کارنامه آزمون شما نیاز به ویرایش یا بازبینی مجدد دارد.",
-                reply_markup=get_main_reply_keyboard(),
+                reply_markup=get_main_reply_keyboard(target_user_id),
             )
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
@@ -823,8 +998,10 @@ async def admin_reject_report(callback: CallbackQuery):
 # ══════════════════════════════════════════════════════════════════
 # [SECTION 11] ادمین: ورود با رمز و پنل اصلی
 # ══════════════════════════════════════════════════════════════════
-async def show_admin_panel(message: Message):
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+async def show_admin_panel(message: Message, edit=False):
+    chat_id = message.chat.id
+    nav_enter(chat_id, "admin", "پنل مدیریت")
+    rows = [
         [InlineKeyboardButton(text="➕ ساخت آزمون جدید", callback_data="admin_create_manual")],
         [InlineKeyboardButton(text="✏️ مدیریت و حذف آزمون‌ها/سگمنت‌ها", callback_data="admin_manage_tests")],
         [InlineKeyboardButton(text="🧠 ویرایش پرامپت تصحیح", callback_data="admin_edit_prompt")],
@@ -832,8 +1009,9 @@ async def show_admin_panel(message: Message):
         [InlineKeyboardButton(text="📢 ارسال نوتیفیکیشن", callback_data="admin_broadcast")],
         [InlineKeyboardButton(text="📊 مشاهده نتایج", callback_data="admin_view_results")],
         [InlineKeyboardButton(text="🗑 پاکسازی کل دیتابیس", callback_data="admin_clear_db")],
-    ])
-    await message.answer("پنل مدیریت پیشرفته:", reply_markup=keyboard)
+    ]
+    await show_screen(message, "پنل مدیریت پیشرفته:", with_nav(chat_id, rows), edit)
+    await refresh_reply_kb(chat_id)
 
 
 @dp.message(F.text == "/admin")
@@ -846,10 +1024,13 @@ async def cmd_admin(message: Message, state: FSMContext):
         await message.answer("❌ دسترسی شما مسدود شده است.")
         return
 
+    nav_reset(message.chat.id)
     if is_admin_user(user_id):
         await show_admin_panel(message)
     else:
-        await message.answer("رمز عبور پنل ادمین را وارد کنید:")
+        nav_enter(message.chat.id, "admin_login", "ورود ادمین")
+        await message.answer("رمز عبور پنل ادمین را وارد کنید:", reply_markup=with_nav(message.chat.id))
+        await refresh_reply_kb(message.chat.id)
         await state.set_state(AdminStates.waiting_for_password)
 
 
@@ -878,6 +1059,7 @@ async def process_admin_password(message: Message, state: FSMContext):
         except Exception:
             pass
         await message.answer("ورود با موفقیت انجام شد!")
+        nav_reset(message.chat.id)
         await show_admin_panel(message)
     elif failed >= 3:
         await state.clear()
@@ -890,7 +1072,7 @@ async def process_admin_password(message: Message, state: FSMContext):
 async def admin_back_to_main(callback: CallbackQuery):
     if not await require_admin(callback):
         return
-    await show_admin_panel(callback.message)
+    await show_admin_panel(callback.message, edit=True)
     await callback.answer()
 
 
@@ -902,6 +1084,8 @@ async def admin_back_to_main(callback: CallbackQuery):
 async def admin_edit_prompt(callback: CallbackQuery, state: FSMContext):
     if not await require_admin(callback):
         return
+    chat_id = callback.message.chat.id
+    nav_enter(chat_id, "admin_prompt", "ویرایش پرامپت")
     await state.set_state(AdminStates.waiting_for_prompt)
     current = get_prompt()
     preview = current[:600] + ("..." if len(current) > 600 else "")
@@ -910,8 +1094,10 @@ async def admin_edit_prompt(callback: CallbackQuery, state: FSMContext):
         "──────────\n"
         "پرامپت جدید را در «یک پیام» بفرستید.\n"
         "• برای برگشت به پیش‌فرض بنویسید: default\n"
-        "• برای لغو بنویسید: cancel"
+        "• برای لغو بنویسید: cancel",
+        reply_markup=with_nav(chat_id),
     )
+    await refresh_reply_kb(chat_id)
     await callback.answer()
 
 
@@ -956,7 +1142,8 @@ async def save_prompt(message: Message, state: FSMContext):
     preview = new_prompt[:300] + ("..." if len(new_prompt) > 300 else "")
     await status.edit_text(
         f"{'✅ پرامپت ذخیره شد' if saved_ok else '❌ ذخیره ناموفق بود'} ({len(new_prompt)} کاراکتر)\n\n"
-        f"{test_line}{warn}\n\nشروع پرامپت:\n{preview}"
+        f"{test_line}{warn}\n\nشروع پرامپت:\n{preview}",
+        reply_markup=with_nav(message.chat.id),
     )
 
 
@@ -965,61 +1152,92 @@ async def save_prompt_invalid(message: Message):
     await message.answer("⚠️ فقط متن بفرستید (نه فایل/عکس/ویس). برای لغو بنویسید: cancel")
 
 
-# ---- 12-ب: تغییر مدل Gemini ----
+# ---- 12-ب: تغییر مدل Gemini (انتخاب با دکمه) ----
+# مدل‌هایی که برای تصحیح صوتی به درد نمی‌خورند (تولید صدا، تصویر، embedding و ...) در لیست نمایش داده نمی‌شوند.
+SKIP_MODEL_WORDS = ("tts", "live", "image", "transcribe", "native-audio", "robotics", "computer-use", "embedding", "veo", "imagen")
+FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
+_model_cache = {"t": 0.0, "models": []}  # لیست مدل‌ها ۵ دقیقه کش می‌شود تا هر بار از گوگل نپرسیم
+
+
+async def get_selectable_models():
+    """(لیست مدل‌ها، پیام خطا یا None). اگر لیست از گوگل نیامد، مدل‌های پیشنهادی برمی‌گردد."""
+    import time
+    now = time.time()
+    if _model_cache["models"] and now - _model_cache["t"] < 300:
+        return _model_cache["models"], None
+    try:
+        models = await list_gemini_models()
+        models = sorted({m for m in models if not any(w in m for w in SKIP_MODEL_WORDS) and len("setmodel_" + m) <= 64}, reverse=True)
+        if not models:
+            raise RuntimeError("لیست خالی بود")
+        _model_cache.update(t=now, models=models)
+        return models, None
+    except Exception as e:
+        return FALLBACK_MODELS, str(e)[:150]
+
+
+async def render_model_screen(message: Message, edit=True, notice=None):
+    """صفحه‌ی انتخاب مدل: هر مدل یک دکمه؛ مدل فعال با ✅ مشخص است."""
+    chat_id = message.chat.id
+    models, err = await get_selectable_models()
+    current = get_model()
+    rows = []
+    for name in models[:12]:
+        mark = "✅ " if name == current else ""
+        rows.append([InlineKeyboardButton(text=f"{mark}{name}", callback_data=f"setmodel_{name}")])
+    rows.append([InlineKeyboardButton(text=f"↩️ مدل پیش‌فرض ({DEFAULT_GEMINI_MODEL})", callback_data="setmodel_default")])
+
+    text = (f"{notice}\n\n" if notice else "") + (
+        f"🤖 مدل فعلی: {current}\n\n"
+        "یکی از مدل‌ها را انتخاب کنید. مدل قبل از ذخیره تست می‌شود و اگر کار نکند ذخیره نمی‌شود."
+    )
+    if err:
+        text += f"\n\n⚠️ لیست مدل‌ها از گوگل گرفته نشد ({err}). مدل‌های پیشنهادی نمایش داده شد."
+    await show_screen(message, text, with_nav(chat_id, rows), edit)
+
+
 @dp.callback_query(F.data == "admin_edit_model")
 async def admin_edit_model(callback: CallbackQuery, state: FSMContext):
     if not await require_admin(callback):
         return
     await callback.answer()
+    await state.clear()
+    chat_id = callback.message.chat.id
+    nav_enter(chat_id, "admin_model", "تغییر مدل")
     status = await callback.message.answer("⏳ در حال گرفتن لیست مدل‌های در دسترس...")
-    try:
-        models = await list_gemini_models()
-        models = sorted(set(models))
-        listing = "\n".join(f"• {m}" for m in models[:25]) if models else "(لیستی دریافت نشد)"
-    except Exception as e:
-        listing = f"(خطا در گرفتن لیست: {str(e)[:200]})"
-
-    await state.set_state(AdminStates.waiting_for_model)
-    await status.edit_text(
-        f"🤖 مدل فعلی: {get_model()}\n\n"
-        f"مدل‌های در دسترس کلید شما:\n{listing}\n\n"
-        "──────────\n"
-        "اسم مدل جدید را بفرستید (مثلاً gemini-3.8-flash).\n"
-        "مدل قبل از ذخیره تست می‌شود و اگر کار نکند ذخیره نمی‌شود.\n"
-        "• برگشت به پیش‌فرض: default\n"
-        "• لغو: cancel"
-    )
+    await render_model_screen(status, edit=True)
+    await refresh_reply_kb(chat_id)
 
 
-@dp.message(AdminStates.waiting_for_model, F.text)
-async def save_model(message: Message, state: FSMContext):
-    name = message.text.strip().replace("models/", "")
-
-    if name.lower() == "cancel":
-        await state.clear()
-        await message.answer("لغو شد. مدل قبلی بدون تغییر ماند.")
+@dp.callback_query(F.data.startswith("setmodel_"))
+async def pick_model(callback: CallbackQuery):
+    """انتخاب مدل با دکمه: اول تست، و فقط اگر کار کرد ذخیره می‌شود."""
+    if not await require_admin(callback):
         return
+    name = callback.data[len("setmodel_"):]
 
-    if name.lower() == "default":
+    if name == "default":
         del_setting("gemini_model")
-        await state.clear()
-        await message.answer(f"✅ مدل به پیش‌فرض برگشت: {DEFAULT_GEMINI_MODEL}")
+        await callback.answer("مدل به پیش‌فرض برگشت")
+        await render_model_screen(callback.message, edit=True, notice=f"✅ مدل به پیش‌فرض برگشت: {DEFAULT_GEMINI_MODEL}")
         return
 
-    if " " in name or len(name) > 80:
-        await message.answer("⚠️ اسم مدل معتبر نیست. فقط اسم مدل را بفرستید، یا برای لغو بنویسید: cancel")
+    if name == get_model():
+        await callback.answer("این مدل همین الان فعال است ✅")
         return
 
-    status = await message.answer(f"⏳ در حال تست مدل {name} ...")
+    await callback.answer(f"⏳ در حال تست {name} ...")
     try:
         await gemini_call("Connection test: reply with the single word OK.", model=name, attempts=1)
     except Exception as e:
-        await status.edit_text(f"❌ مدل {name} کار نکرد و ذخیره نشد:\n{str(e)[:600]}\n\nاسم دیگری بفرستید یا بنویسید: cancel")
+        await render_model_screen(callback.message, edit=True, notice=f"❌ مدل {name} کار نکرد و ذخیره نشد:\n{str(e)[:400]}")
         return
 
     set_setting("gemini_model", name)
-    await state.clear()
-    await status.edit_text(f"✅ مدل تست شد و ذخیره شد: {name}\nاز این به بعد تصحیح‌ها با این مدل انجام می‌شود.")
+    await render_model_screen(
+        callback.message, edit=True,
+        notice=f"✅ مدل تست شد و ذخیره شد: {name}\nاز این به بعد تصحیح‌ها با این مدل انجام می‌شود.",
+    )
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1030,7 +1248,10 @@ async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
     if not await require_admin(callback):
         return
     await state.set_state(AdminStates.waiting_for_broadcast_message)
-    await callback.message.answer("📢 متن پیام همگانی را بفرستید:")
+    chat_id = callback.message.chat.id
+    nav_enter(chat_id, "admin_broadcast", "پیام همگانی")
+    await callback.message.answer("📢 متن پیام همگانی را بفرستید:", reply_markup=with_nav(chat_id))
+    await refresh_reply_kb(chat_id)
     await callback.answer()
 
 
@@ -1067,7 +1288,10 @@ async def admin_create_manual(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="تعیین سطح", callback_data="type_placement"),
          InlineKeyboardButton(text="ماک کامل", callback_data="type_mock")]
     ])
-    await callback.message.answer("نوع آزمون را انتخاب کنید:", reply_markup=keyboard)
+    chat_id = callback.message.chat.id
+    nav_enter(chat_id, "admin_new_test", "ساخت آزمون")
+    await callback.message.answer("نوع آزمون را انتخاب کنید:", reply_markup=with_nav(chat_id, keyboard.inline_keyboard))
+    await refresh_reply_kb(chat_id)
     await callback.answer()
 
 
@@ -1077,7 +1301,7 @@ async def process_test_type(callback: CallbackQuery, state: FSMContext):
         return
     t_type = callback.data.split("_")[1]
     await state.update_data(test_type=t_type)
-    await callback.message.answer("عنوان آزمون را ارسال کنید:")
+    await callback.message.answer("عنوان آزمون را ارسال کنید:", reply_markup=with_nav(callback.message.chat.id))
     await state.set_state(AdminStates.waiting_for_test_title)
     await callback.answer()
 
@@ -1103,7 +1327,7 @@ async def process_test_title(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="انگلیسی 🇬🇧", callback_data="lang_en"),
          InlineKeyboardButton(text="فارسی 🇮🇷", callback_data="lang_fa")]
     ])
-    await message.answer(f"آزمون «{title}» ثبت شد.\n\nزبان سگمنت شماره ۱:", reply_markup=keyboard)
+    await message.answer(f"آزمون «{title}» ثبت شد.\n\nزبان سگمنت شماره ۱:", reply_markup=with_nav(message.chat.id, keyboard.inline_keyboard))
 
 
 @dp.callback_query(F.data.startswith("lang_"))
@@ -1112,7 +1336,7 @@ async def process_segment_lang(callback: CallbackQuery, state: FSMContext):
         return
     lang = callback.data.split("_")[1]
     await state.update_data(segment_lang=lang)
-    await callback.message.answer("فایل صوتی سگمنت را بفرستید:")
+    await callback.message.answer("فایل صوتی سگمنت را بفرستید:", reply_markup=with_nav(callback.message.chat.id))
     await state.set_state(AdminStates.waiting_for_segment_audio)
     await callback.answer()
 
@@ -1126,7 +1350,10 @@ async def process_segment_audio(message: Message, state: FSMContext):
     else:
         file_id, mime = message.document.file_id, message.document.mime_type or "audio/mpeg"
     await state.update_data(file_id=file_id, file_mime=mime)
-    await message.answer("متن راهنما (Tip) این سگمنت را بفرستید (توصیه‌ها یا نکات برای کاربر قبل از پخش صوت):")
+    await message.answer(
+        "متن راهنما (Tip) این سگمنت را بفرستید (توصیه‌ها یا نکات برای کاربر قبل از پخش صوت):",
+        reply_markup=with_nav(message.chat.id),
+    )
     await state.set_state(AdminStates.waiting_for_segment_tip)
 
 
@@ -1137,7 +1364,8 @@ async def process_segment_tip(message: Message, state: FSMContext):
         "🔑 حالا «کلید تصحیح» این سگمنت را بفرستید.\n\n"
         "مثلاً ترجمه‌ی درست، اعداد و نکات کلیدی که باید در جواب کاربر باشد. "
         "این متن فقط برای شما نمایش داده می‌شود (در بررسی دستی، زیر ویس کاربر) و به هوش مصنوعی هم به‌عنوان مرجع داده می‌شود.\n\n"
-        "اگر کلیدی ندارید بنویسید: -"
+        "اگر کلیدی ندارید بنویسید: -",
+        reply_markup=with_nav(message.chat.id),
     )
     await state.set_state(AdminStates.waiting_for_segment_key)
 
@@ -1164,7 +1392,7 @@ async def process_segment_key(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="افزودن سگمنت بعدی", callback_data="admin_add_more_segment")],
         [InlineKeyboardButton(text="✅ پایان بارگذاری و ذخیره آزمون", callback_data="admin_finish_test")],
     ])
-    await message.answer(f"سگمنت {seg_index} با موفقیت ثبت شد.", reply_markup=keyboard)
+    await message.answer(f"سگمنت {seg_index} با موفقیت ثبت شد.", reply_markup=with_nav(message.chat.id, keyboard.inline_keyboard))
 
 
 @dp.callback_query(F.data == "admin_add_more_segment")
@@ -1178,7 +1406,7 @@ async def admin_add_more_segment(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="انگلیسی 🇬🇧", callback_data="lang_en"),
          InlineKeyboardButton(text="فارسی 🇮🇷", callback_data="lang_fa")]
     ])
-    await callback.message.answer(f"زبان سگمنت {new_index}:", reply_markup=keyboard)
+    await callback.message.answer(f"زبان سگمنت {new_index}:", reply_markup=with_nav(callback.message.chat.id, keyboard.inline_keyboard))
     await callback.answer()
 
 
@@ -1195,26 +1423,27 @@ async def admin_finish_test(callback: CallbackQuery, state: FSMContext):
 # ══════════════════════════════════════════════════════════════════
 # [SECTION 15] ادمین: مدیریت و حذف آزمون/سگمنت
 # ══════════════════════════════════════════════════════════════════
-async def render_manage_tests(callback: CallbackQuery):
+async def render_manage_tests(message: Message, edit=False):
+    chat_id = message.chat.id
+    nav_enter(chat_id, "admin_tests", "مدیریت آزمون‌ها")
     with db() as conn:
         tests = conn.execute("SELECT id, title, test_type FROM tests").fetchall()
 
     if not tests:
-        await callback.message.edit_text("هیچ آزمونی وجود ندارد.")
-        await show_admin_panel(callback.message)
-        return
-
-    buttons = []
-    for t in tests:
-        buttons.append([
-            InlineKeyboardButton(text=f"📂 {t[1]}", callback_data=f"manage_test_{t[0]}"),
-            InlineKeyboardButton(text="❌ حذف آزمون", callback_data=f"del_test_{t[0]}"),
-        ])
-    buttons.append([InlineKeyboardButton(text="🔙 بازگشت به پنل", callback_data="admin_back_to_main")])
-    await callback.message.edit_text("مدیریت و حذف آزمون‌ها:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        await show_screen(message, "هیچ آزمونی وجود ندارد.", with_nav(chat_id), edit)
+    else:
+        buttons = []
+        for t in tests:
+            buttons.append([
+                InlineKeyboardButton(text=f"📂 {t[1]}", callback_data=f"manage_test_{t[0]}"),
+                InlineKeyboardButton(text="❌ حذف آزمون", callback_data=f"del_test_{t[0]}"),
+            ])
+        await show_screen(message, "مدیریت و حذف آزمون‌ها:", with_nav(chat_id, buttons), edit)
+    await refresh_reply_kb(chat_id)
 
 
-async def render_manage_single_test(callback: CallbackQuery, test_id: int):
+async def render_manage_single_test(message: Message, test_id: int, edit=False):
+    chat_id = message.chat.id
     with db() as conn:
         test_row = conn.execute("SELECT title FROM tests WHERE id = ?", (test_id,)).fetchone()
         segments = conn.execute(
@@ -1222,24 +1451,25 @@ async def render_manage_single_test(callback: CallbackQuery, test_id: int):
         ).fetchall()
 
     if not test_row:
-        await render_manage_tests(callback)
+        await render_manage_tests(message, edit)
         return
 
+    nav_enter(chat_id, f"admin_test:{test_id}", "سگمنت‌های آزمون")
     buttons = []
     for s in segments:
         buttons.append([
             InlineKeyboardButton(text=f"سگمنت {s[1]} ({s[2]})", callback_data=f"noop_{s[0]}"),
             InlineKeyboardButton(text="❌ حذف سگمنت", callback_data=f"del_seg_{s[0]}_{test_id}"),
         ])
-    buttons.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin_manage_tests")])
-    await callback.message.edit_text(f"مدیریت سگمنت‌های آزمون «{test_row[0]}»:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await show_screen(message, f"مدیریت سگمنت‌های آزمون «{test_row[0]}»:", with_nav(chat_id, buttons), edit)
+    await refresh_reply_kb(chat_id)
 
 
 @dp.callback_query(F.data == "admin_manage_tests")
 async def admin_manage_tests(callback: CallbackQuery):
     if not await require_admin(callback):
         return
-    await render_manage_tests(callback)
+    await render_manage_tests(callback.message, edit=True)
     await callback.answer()
 
 
@@ -1253,7 +1483,7 @@ async def admin_delete_test(callback: CallbackQuery):
         conn.execute("DELETE FROM tests WHERE id = ?", (test_id,))
         conn.commit()
     await callback.answer("آزمون و سگمنت‌های آن حذف شدند!", show_alert=True)
-    await render_manage_tests(callback)
+    await render_manage_tests(callback.message, edit=True)
 
 
 @dp.callback_query(F.data.startswith("manage_test_"))
@@ -1261,7 +1491,7 @@ async def manage_single_test(callback: CallbackQuery):
     if not await require_admin(callback):
         return
     test_id = int(callback.data.split("_")[2])
-    await render_manage_single_test(callback, test_id)
+    await render_manage_single_test(callback.message, test_id, edit=True)
     await callback.answer()
 
 
@@ -1282,7 +1512,7 @@ async def admin_delete_segment(callback: CallbackQuery):
         conn.execute("DELETE FROM segments WHERE id = ?", (seg_id,))
         conn.commit()
     await callback.answer("سگمنت حذف شد!", show_alert=True)
-    await render_manage_single_test(callback, test_id)
+    await render_manage_single_test(callback.message, test_id, edit=True)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1292,13 +1522,16 @@ async def admin_delete_segment(callback: CallbackQuery):
 async def admin_view_results(callback: CallbackQuery):
     if not await require_admin(callback):
         return
+    chat_id = callback.message.chat.id
+    nav_enter(chat_id, "admin_results", "نتایج")
     with db() as conn:
         rows = conn.execute("SELECT username, test_title, date FROM results ORDER BY id DESC LIMIT 10").fetchall()
     if not rows:
-        await callback.message.answer("نتیجه‌ای ثبت نشده است.")
+        text = "نتیجه‌ای ثبت نشده است."
     else:
         text = "۱۰ نتیجه اخیر:\n\n" + "\n".join([f"کاربر: {r[0]} | آزمون: {r[1]} | {r[2]}" for r in rows])
-        await callback.message.answer(text)
+    await callback.message.answer(text, reply_markup=with_nav(chat_id))
+    await refresh_reply_kb(chat_id)
     await callback.answer()
 
 
@@ -1306,11 +1539,17 @@ async def admin_view_results(callback: CallbackQuery):
 async def admin_clear_db(callback: CallbackQuery):
     if not await require_admin(callback):
         return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    chat_id = callback.message.chat.id
+    nav_enter(chat_id, "admin_clear", "پاکسازی دیتابیس")
+    rows = [
         [InlineKeyboardButton(text="⚠️ بله، همه چیز پاک شود", callback_data="admin_clear_db_confirm")],
         [InlineKeyboardButton(text="🔙 انصراف", callback_data="admin_back_to_main")],
-    ])
-    await callback.message.answer("آیا مطمئنی؟ همه آزمون‌ها، سگمنت‌ها، نتایج و لیست کاربران پاک می‌شود.", reply_markup=kb)
+    ]
+    await callback.message.answer(
+        "آیا مطمئنی؟ همه آزمون‌ها، سگمنت‌ها، نتایج و لیست کاربران پاک می‌شود.",
+        reply_markup=with_nav(chat_id, rows),
+    )
+    await refresh_reply_kb(chat_id)
     await callback.answer()
 
 
@@ -1327,7 +1566,7 @@ async def admin_clear_db_confirm(callback: CallbackQuery):
         conn.execute("DELETE FROM tests")
         conn.execute("DELETE FROM users")
         conn.commit()
-    await callback.message.answer("پاکسازی کل اطلاعات انجام شد.")
+    await callback.message.answer("پاکسازی کل اطلاعات انجام شد.", reply_markup=with_nav(callback.message.chat.id))
     await callback.answer()
 
 
