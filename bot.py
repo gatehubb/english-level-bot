@@ -33,6 +33,9 @@
 import os
 import io
 import json
+import re
+import time
+import zipfile
 import asyncio
 import logging
 import sqlite3
@@ -49,6 +52,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.types import FSInputFile, BufferedInputFile, InputMediaDocument
 
 from google import genai
 from google.genai import types
@@ -67,6 +71,12 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 DEFAULT_GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_TIMEOUT = int(os.environ.get("GEMINI_TIMEOUT", "180"))  # ثانیه برای هر درخواست
 DB_PATH = os.environ.get("DB_PATH", "bot_database.db")
+
+# پشتیبان‌گیری خودکار از دیتابیس در یک «کانال خصوصی تلگرام» تا با هر دیپلوی آزمون‌ها پاک نشوند.
+# شناسه‌ی کانال (مثل -1001234567890). راهنمای راه‌اندازی: پنل ادمین > «پشتیبان‌گیری از دیتابیس»
+BACKUP_CHAT_ID = os.environ.get("BACKUP_CHAT_ID", "").strip()
+BACKUP_INTERVAL = int(os.environ.get("BACKUP_INTERVAL", "30"))   # هر چند ثانیه چک شود که دیتابیس تغییر کرده یا نه
+ZIP_MAX_BYTES = 20 * 1024 * 1024   # سقف دانلود فایل توسط ربات‌های تلگرام ۲۰ مگابایت است
 
 # افکت شمارش معکوس قبل از پخش هر سگمنت (برای خاموش کردن: COUNTDOWN_ENABLED=0)
 COUNTDOWN_ENABLED = os.environ.get("COUNTDOWN_ENABLED", "1") == "1"
@@ -114,7 +124,7 @@ DEFAULT_PROMPT = """Role: You are an expert, strict and professional NAATI CCL e
   * Lexical/Grammar: inappropriate collocations or structural shifts that affect meaning.
 - Mandatory self-correction: before you finish, review your own list once more and remove any deduction that is not justified or whose weight does not match the severity of the error.
 
-2. QUALITY SCORES (judge from the AUDIO itself, each on a strict scale from 1 to 10):
+2. QUALITY (judge from the AUDIO itself. Each criterion starts from 10 points: you report the points DEDUCTED, in steps of 0.5, with a concrete reason. 0 = perfect):
 - Quality of Language: register, natural collocations, avoiding word-for-word translation, correct functional grammar.
 - Quality of Delivery: hesitations, disruptive pauses and fillers, excessive self-correction, intonation matching the speaker's tone, professional confidence.
 - Pronunciation: clarity and intelligibility (a native accent is not required, clarity is).
@@ -186,6 +196,12 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+        # مهاجرت: ویس اینتروداکشن آزمون (فقط برای ماک کامل؛ فقط برای پخش به کاربر)
+        try:
+            c.execute("ALTER TABLE tests ADD COLUMN intro_file_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+
         # مهاجرت: ستون is_admin (رفع باگ: کسی که یک بار رمز غلط می‌زد ادمین حساب می‌شد)
         try:
             c.execute("ALTER TABLE admins ADD COLUMN is_admin INTEGER DEFAULT 0")
@@ -204,6 +220,70 @@ def init_db():
         conn.commit()
 
 
+# ---------- پشتیبان‌گیری از دیتابیس در تلگرام: بازیابی بعد از دیپلوی ----------
+# روش کار: نسخه‌ی دیتابیس به‌صورت یک فایل «پین‌شده» در کانال خصوصی نگه داشته می‌شود.
+# اگر بعد از دیپلوی فایل دیتابیس نبود (هاست رایگان همه‌چیز را پاک می‌کند)، آخرین نسخه از آن کانال برمی‌گردد.
+# فایل‌های صوتی داخل دیتابیس فقط به‌صورت file_id ذخیره‌اند، پس دیتابیس کوچک است.
+backup_state = {"msg_id": None, "last_mtime": 0.0, "last_time": 0.0, "last_ok": None, "last_error": None}
+
+
+def _backup_target():
+    try:
+        return int(BACKUP_CHAT_ID)
+    except (TypeError, ValueError):
+        return BACKUP_CHAT_ID
+
+
+async def _restore_with_bot(b):
+    """آخرین فایل پین‌شده‌ی کانال را به‌عنوان دیتابیس دانلود می‌کند. شناسه‌ی پیام را برمی‌گرداند (یا None)."""
+    chat = await b.get_chat(_backup_target())
+    pm = getattr(chat, "pinned_message", None)
+    doc = getattr(pm, "document", None) if pm else None
+    if not doc:
+        return None
+    await b.download(doc.file_id, destination=DB_PATH)
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as c:
+            ok = c.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    except Exception:
+        ok = False
+    if not ok:
+        try:
+            os.remove(DB_PATH)
+        except OSError:
+            pass
+        return None
+    return pm.message_id
+
+
+def restore_db_if_missing():
+    if not BACKUP_CHAT_ID:
+        logging.warning("BACKUP_CHAT_ID تنظیم نشده است؛ با هر دیپلوی روی هاست رایگان، آزمون‌ها پاک می‌شوند.")
+        return
+    if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
+        return
+
+    async def _go():
+        tmp = Bot(token=TELEGRAM_BOT_TOKEN)
+        try:
+            return await _restore_with_bot(tmp)
+        finally:
+            await tmp.session.close()
+
+    try:
+        mid = asyncio.run(_go())
+    except Exception as err:
+        logging.error(f"بازیابی دیتابیس از کانال پشتیبان ناموفق بود: {err}")
+        return
+    if mid:
+        backup_state["msg_id"] = mid
+        backup_state["last_mtime"] = os.path.getmtime(DB_PATH)
+        logging.info("دیتابیس از کانال پشتیبان بازیابی شد ✅")
+    else:
+        logging.info("نسخه‌ی پشتیبانی در کانال پیدا نشد؛ دیتابیس تازه ساخته می‌شود.")
+
+
+restore_db_if_missing()
 init_db()
 
 
@@ -238,6 +318,71 @@ def get_model():
     return get_setting("gemini_model", DEFAULT_GEMINI_MODEL)
 
 
+# ---------- پشتیبان‌گیری خودکار (ادامه) ----------
+async def backup_db_now(reason=""):
+    """یک نسخه‌ی سالم از دیتابیس می‌گیرد و فایل پین‌شده‌ی کانال پشتیبان را با آن جایگزین می‌کند."""
+    if not BACKUP_CHAT_ID or not os.path.exists(DB_PATH):
+        return False
+    tmp_path = DB_PATH + ".backup"
+    try:
+        mtime = os.path.getmtime(DB_PATH)
+
+        def _snapshot():
+            with closing(sqlite3.connect(DB_PATH)) as src, closing(sqlite3.connect(tmp_path)) as dst:
+                src.backup(dst)
+
+        await asyncio.to_thread(_snapshot)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+        caption = f"💾 پشتیبان دیتابیس ربات\n🕒 {stamp} UTC" + (f"\nℹ️ {reason}" if reason else "")
+        target = _backup_target()
+        done = False
+        mid = backup_state["msg_id"]
+        if mid:
+            try:
+                await bot.edit_message_media(
+                    chat_id=target, message_id=mid,
+                    media=InputMediaDocument(media=FSInputFile(tmp_path, filename="bot_database.db"), caption=caption),
+                )
+                done = True
+            except TelegramBadRequest as err:
+                if "not modified" in str(err).lower():
+                    done = True
+                else:
+                    logging.warning(f"edit backup message failed, sending a new one: {err}")
+        if not done:
+            sent = await bot.send_document(
+                target, FSInputFile(tmp_path, filename="bot_database.db"), caption=caption, disable_notification=True
+            )
+            backup_state["msg_id"] = sent.message_id
+            try:
+                await bot.pin_chat_message(target, sent.message_id, disable_notification=True)
+            except Exception as err:
+                logging.warning(f"pin backup message failed: {err}")
+                backup_state["last_error"] = f"پین نشد (ربات باید اجازه‌ی Pin messages داشته باشد): {err}"
+        backup_state.update(last_mtime=mtime, last_time=time.time(), last_ok=True)
+        return True
+    except Exception as err:
+        logging.error(f"backup failed: {err}")
+        backup_state.update(last_ok=False, last_error=str(err)[:300])
+        return False
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+async def backup_loop():
+    """هر چند ثانیه چک می‌کند و اگر دیتابیس تغییر کرده بود، پشتیبان می‌گیرد."""
+    while True:
+        await asyncio.sleep(BACKUP_INTERVAL)
+        try:
+            if os.path.exists(DB_PATH) and os.path.getmtime(DB_PATH) != backup_state["last_mtime"]:
+                await backup_db_now("تغییر خودکار")
+        except Exception as err:
+            logging.error(f"backup loop error: {err}")
+
+
 # ══════════════════════════════════════════════════════════════════
 # [SECTION 6] State ها
 # ══════════════════════════════════════════════════════════════════
@@ -253,11 +398,14 @@ class AdminStates(StatesGroup):
     waiting_for_custom_report = State()
     waiting_for_prompt = State()
     waiting_for_total = State()
+    waiting_for_intro = State()
+    waiting_for_zip = State()
 
 
 class UserTestStates(StatesGroup):
     taking_test = State()
     waiting_for_tip_ack = State()
+    waiting_for_intro = State()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -395,6 +543,17 @@ async def send_long(chat_id, text, reply_markup=None):
     chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)] or [" "]
     for i, chunk in enumerate(chunks):
         await bot.send_message(chat_id, chunk, reply_markup=reply_markup if i == len(chunks) - 1 else None)
+
+
+async def send_audio_any(target: Message, file_id):
+    """فایل صوتی را به هر شکلی که ذخیره شده بفرستد: ویس، آهنگ یا فایل."""
+    try:
+        return await target.answer_voice(voice=file_id)
+    except Exception:
+        try:
+            return await target.answer_audio(audio=file_id)
+        except Exception:
+            return await target.answer_document(document=file_id)
 
 
 async def play_countdown(message: Message):
@@ -597,14 +756,24 @@ def normalize_segment_result(raw, idx, direction, seg_max):
     total_ded = round(sum(e["deduction"] for e in errors), 2)
 
     def quality(key):
+        """هر معیار کیفی به‌صورت «نمره‌ی کسرشده از ۱۰» می‌آید. (فرمت قدیمی با score هم پذیرفته می‌شود.)"""
         d = raw.get(key)
         if not isinstance(d, dict):
-            d = {"score": d}
-        try:
-            score = float(d.get("score"))
-        except (TypeError, ValueError):
-            raise ValueError(f"نمره‌ی «{key}» در پاسخ هوش مصنوعی نبود")
-        return {"score": clamp_num(score, 0, 10), "note": str(d.get("note_fa") or d.get("note") or "").strip()}
+            d = {"deduction": d}
+        reason = str(d.get("reason_fa") or d.get("note_fa") or d.get("reason") or d.get("note") or "").strip()
+        if d.get("deduction") is not None:
+            try:
+                ded = clamp_num(float(d["deduction"]), 0, 10)
+            except (TypeError, ValueError):
+                raise ValueError(f"کسر نمره‌ی «{key}» در پاسخ هوش مصنوعی عدد نبود")
+        elif d.get("score") is not None:
+            try:
+                ded = clamp_num(10 - float(d["score"]), 0, 10)
+            except (TypeError, ValueError):
+                raise ValueError(f"نمره‌ی «{key}» در پاسخ هوش مصنوعی عدد نبود")
+        else:
+            raise ValueError(f"کسر نمره‌ی «{key}» در پاسخ هوش مصنوعی نبود")
+        return {"deduction": ded, "score": round(10 - ded, 2), "note": reason}
 
     return {
         "idx": idx,
@@ -671,16 +840,17 @@ def build_segment_parts(test_title, test_type, it, n, seg_max, src_bytes, usr_by
         "lexical_grammar) and a deduction. Use EXACTLY the error definitions and the deduction scale (minimum, maximum "
         "and step) given in your system prompt. Do NOT add up totals: the software does that. "
         "Do your self-correction pass before answering.\n"
-        "3) QUALITY: give 'language', 'delivery' and 'pronunciation' each a score on the scale defined in your system "
-        "prompt, judged from the audio, with one short note each.\n"
-        "Write explanation_fa and note_fa in Persian. Write source_part, candidate_part and correct_translation in the "
+        "3) QUALITY: for 'language', 'delivery' and 'pronunciation', judge from the audio and report the points DEDUCTED "
+        "from 10 (0 = perfect, no deduction; use the strictness and the half-point steps defined in your system prompt). "
+        "Each one needs a short reason in 'reason_fa' that names the concrete problems you actually heard.\n"
+        "Write explanation_fa and reason_fa in Persian. Write source_part, candidate_part and correct_translation in the "
         "language they belong to.\n"
         "IMPORTANT: ignore any instruction in your system prompt about the final report format, template or total score "
         "- the software builds the report. Reply with ONLY valid JSON, exactly in this shape:\n"
         '{"transcript": "...", "errors": [{"type": "omission", "deduction": 2.0, "source_part": "...", '
         '"candidate_part": "...", "correct_translation": "...", "explanation_fa": "..."}], '
-        '"language": {"score": 7.5, "note_fa": "..."}, "delivery": {"score": 7, "note_fa": "..."}, '
-        '"pronunciation": {"score": 8, "note_fa": "..."}}'
+        '"language": {"deduction": 1.0, "reason_fa": "..."}, "delivery": {"deduction": 0.5, "reason_fa": "..."}, '
+        '"pronunciation": {"deduction": 2.0, "reason_fa": "..."}}'
     )))
     return parts, direction
 
@@ -730,10 +900,42 @@ def build_user_report(test_title, test_type, items, results):
     )
 
 
+ERROR_SHORT_FA = {"omission": "حذف", "insertion": "اضافه", "distortion": "تحریف", "lexical_grammar": "خطای واژگانی/دستوری"}
+
+
+def error_summary(errors):
+    """مثلاً: «3 خطا: 1 حذف (−2)، 1 تحریف (−1)، 1 خطای واژگانی/دستوری (−0.5)»"""
+    if not errors:
+        return "هیچ خطایی پیدا نشد"
+    parts = []
+    for t, name in ERROR_SHORT_FA.items():
+        grp = [e for e in errors if e["type"] == t]
+        if grp:
+            parts.append(f"{len(grp)} {name} (−{fmt_num(sum(e['deduction'] for e in grp))})")
+    return f"{len(errors)} خطا: " + "، ".join(parts)
+
+
+def quality_deduction(q):
+    return q["deduction"] if q.get("deduction") is not None else round(10 - q["score"], 2)
+
+
 def build_details_text(sub, items, results):
-    """جزئیات کارنامه برای استاد: متن شنیده‌شده، اشکالات ترجمه، ترجمه‌ی درست و نمره‌ی هر سگمنت."""
+    """جزئیات کارنامه برای استاد: برای هر بخش «چقدر و چرا کسر شده»، متن شنیده‌شده، اشکالات و ترجمه‌ی درست."""
     _, user_id, label, test_title, test_type = sub
+    acc_max = ACCURACY_MAX.get(test_type, 100)
+    rs = [results[it[0]] for it in items if it[0] in results]
     out = [f"📄 جزئیات کارنامه\n📚 {test_title}\n👤 {label}"]
+
+    if rs:
+        n = len(rs)
+        acc = round(sum(r["accuracy"] for r in rs), 2)
+        total_ded = round(sum(r["deduction"] for r in rs), 2)
+        lines = ["\n📊 خلاصه‌ی کل", f"🎯 دقت: −{fmt_num(total_ded)}  ←  {fmt_num(acc)} / {acc_max}"]
+        for key, title in (("language", "🗣 زبان"), ("delivery", "🎤 ارائه"), ("pronunciation", "🔊 تلفظ")):
+            avg_ded = round(sum(quality_deduction(r[key]) for r in rs) / n, 2)
+            lines.append(f"{title}: میانگین کسر −{fmt_num(avg_ded)}  ←  {fmt_num(round(10 - avg_ded, 1))} / 10")
+        out.append("\n".join(lines))
+
     for it in items:
         idx, _v, _sf, seg_lang, _mime, seg_key, seg_source = it
         dir_fa = "انگلیسی ➡️ فارسی" if seg_lang == "en" else "فارسی ➡️ انگلیسی"
@@ -742,11 +944,23 @@ def build_details_text(sub, items, results):
         if not r:
             out.append("⏳ این سگمنت هنوز تصحیح نشده است.")
             continue
-        out.append(f"🎯 دقت: {fmt_num(r['accuracy'])} / {fmt_num(r['seg_max'])}   (کسر شده: {fmt_num(r['deduction'])})")
+
+        seg_lines = []
+        if r["deduction"] > 0:
+            seg_lines.append(f"🎯 دقت: −{fmt_num(r['deduction'])} از {fmt_num(r['seg_max'])}  ←  {fmt_num(r['accuracy'])} / {fmt_num(r['seg_max'])}")
+            seg_lines.append(f"      ↳ کسر شده به خاطر {error_summary(r['errors'])}")
+        else:
+            seg_lines.append(f"🎯 دقت: بدون کسر ✅  ({fmt_num(r['accuracy'])} / {fmt_num(r['seg_max'])})")
         for key, title in (("language", "🗣 زبان"), ("delivery", "🎤 ارائه"), ("pronunciation", "🔊 تلفظ")):
             q = r[key]
-            note = f" - {q['note']}" if q["note"] else ""
-            out.append(f"{title}: {fmt_num(q['score'])} / 10{note}")
+            ded = quality_deduction(q)
+            if ded > 0:
+                seg_lines.append(f"{title}: −{fmt_num(ded)}  ←  {fmt_num(10 - ded)} / 10")
+                seg_lines.append(f"      ↳ به دلیل: {q['note'] or 'دلیلی ثبت نشده'}")
+            else:
+                seg_lines.append(f"{title}: بدون کسر ✅  (10 / 10)")
+        out.append("\n".join(seg_lines))
+
         if r["transcript"]:
             out.append(f"\n📝 متن شنیده‌شده از پاسخ کاربر:\n{r['transcript']}")
         if r["errors"]:
@@ -762,8 +976,6 @@ def build_details_text(sub, items, results):
                 if e["explanation"]:
                     block.append(f"   💬 {e['explanation']}")
                 out.append("\n".join(block))
-        else:
-            out.append("\n✅ خطایی پیدا نشد.")
         if seg_source:
             out.append(f"\n📌 متن اصلی سگمنت:\n{seg_source}")
         if seg_key:
@@ -1007,7 +1219,7 @@ async def user_start_test(callback: CallbackQuery, state: FSMContext):
     test_id = int(callback.data.split("_")[2])
 
     with db() as conn:
-        test_row = conn.execute("SELECT title, test_type FROM tests WHERE id = ?", (test_id,)).fetchone()
+        test_row = conn.execute("SELECT title, test_type, intro_file_id FROM tests WHERE id = ?", (test_id,)).fetchone()
         segments = conn.execute(
             "SELECT id, file_id, segment_lang, segment_tip, file_mime, answer_key, source_text FROM segments WHERE test_id = ? ORDER BY segment_index ASC",
             (test_id,),
@@ -1023,7 +1235,7 @@ async def user_start_test(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    test_title, test_type = test_row
+    test_title, test_type, intro_file_id = test_row
 
     await state.set_state(UserTestStates.taking_test)
     await state.update_data(
@@ -1037,8 +1249,30 @@ async def user_start_test(callback: CallbackQuery, state: FSMContext):
 
     nav_enter(callback.message.chat.id, "exam", "آزمون")
     await refresh_reply_kb(callback.message.chat.id)
-    await show_segment_tip(callback.message, state)
+    if intro_file_id:
+        # ماک کامل: اول ویس اینتروداکشن (فقط پخش، بدون پاسخ)، بعد سگمنت اول
+        await state.set_state(UserTestStates.waiting_for_intro)
+        await callback.message.answer("🎬 اینتروداکشن آزمون\n\nلطفاً توضیحات زیر را گوش دهید. نیازی به پاسخ دادن نیست 🙂")
+        await send_audio_any(callback.message, intro_file_id)
+        await callback.message.answer(
+            "وقتی اینتروداکشن تمام شد و آماده بودید، دکمه‌ی زیر را بزنید 👇",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ گوش دادم، شروع آزمون", callback_data="intro_continue")]
+            ]),
+        )
+    else:
+        await show_segment_tip(callback.message, state)
     await callback.answer()
+
+
+@dp.callback_query(UserTestStates.waiting_for_intro, F.data == "intro_continue")
+async def intro_continue(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await show_segment_tip(callback.message, state)
 
 
 async def show_segment_tip(message: Message, state: FSMContext):
@@ -1075,7 +1309,8 @@ async def ack_tip_and_play(callback: CallbackQuery, state: FSMContext):
             pass
 
     await callback.answer()  # زودتر جواب بده تا دکمه در حال بارگذاری نماند
-    await play_countdown(callback.message)  # افکت ۳-۲-۱-حرکت
+    if curr_idx == 0:
+        await play_countdown(callback.message)  # افکت «حاضری؟ آماده‌ای؟ حرکت!» فقط قبل از اولین سگمنت
 
     lang_dir = "انگلیسی به فارسی 🇬🇧 ➡️ 🇮🇷" if seg[2] == "en" else "فارسی به انگلیسی 🇮🇷 ➡️ 🇬🇧"
 
@@ -1410,12 +1645,53 @@ async def show_admin_panel(message: Message, edit=False):
         [InlineKeyboardButton(text="✏️ مدیریت و حذف آزمون‌ها/سگمنت‌ها", callback_data="admin_manage_tests")],
         [InlineKeyboardButton(text="🧠 ویرایش پرامپت تصحیح", callback_data="admin_edit_prompt")],
         [InlineKeyboardButton(text="🤖 تغییر مدل Gemini", callback_data="admin_edit_model")],
+        [InlineKeyboardButton(text="💾 پشتیبان‌گیری از دیتابیس", callback_data="admin_backup")],
         [InlineKeyboardButton(text="📢 ارسال نوتیفیکیشن", callback_data="admin_broadcast")],
         [InlineKeyboardButton(text="📊 مشاهده نتایج", callback_data="admin_view_results")],
         [InlineKeyboardButton(text="🗑 پاکسازی کل دیتابیس", callback_data="admin_clear_db")],
     ]
     await show_screen(message, "پنل مدیریت پیشرفته:", with_nav(chat_id, rows), edit)
     await refresh_reply_kb(chat_id)
+
+
+@dp.callback_query(F.data == "admin_backup")
+async def admin_backup(callback: CallbackQuery):
+    """وضعیت پشتیبان‌گیری + گرفتن پشتیبان همین الان."""
+    if not await require_admin(callback):
+        return
+    await callback.answer()
+    chat_id = callback.message.chat.id
+    nav_enter(chat_id, "admin_backup", "پشتیبان‌گیری")
+    if not BACKUP_CHAT_ID:
+        text = (
+            "💾 پشتیبان‌گیری هنوز فعال نیست\n\n"
+            "برای اینکه با هر دیپلوی آزمون‌ها پاک نشوند:\n"
+            "1️⃣ در تلگرام یک «کانال خصوصی» بسازید.\n"
+            "2️⃣ ربات را به‌عنوان «ادمین» به کانال اضافه کنید (با دسترسی ارسال پیام، ویرایش پیام‌ها و Pin messages).\n"
+            "3️⃣ داخل کانال بنویسید: /id  ← ربات شناسه‌ی کانال را می‌فرستد (شبیه -1001234567890).\n"
+            "4️⃣ در Render: Environment > یک متغیر جدید با نام BACKUP_CHAT_ID و مقدار همان شناسه، و بعد دیپلوی دوباره."
+        )
+    else:
+        status = await callback.message.answer("⏳ در حال گرفتن پشتیبان...")
+        ok = await backup_db_now("دستی توسط ادمین")
+        when = time.strftime("%H:%M:%S", time.gmtime(backup_state["last_time"])) if backup_state["last_time"] else "-"
+        text = (
+            ("✅ پشتیبان گرفته شد" if ok else "❌ پشتیبان‌گیری ناموفق بود") + f"  (ساعت {when} UTC)\n\n"
+            + (f"⚠️ {backup_state['last_error']}\n\n" if backup_state["last_error"] else "")
+            + f"🔁 هر {BACKUP_INTERVAL} ثانیه، اگر دیتابیس تغییر کرده باشد خودکار پشتیبان گرفته می‌شود و موقع خاموش شدن ربات هم یک پشتیبان آخر گرفته می‌شود."
+        )
+        try:
+            await status.delete()
+        except Exception:
+            pass
+    await callback.message.answer(text, reply_markup=with_nav(chat_id))
+    await refresh_reply_kb(chat_id)
+
+
+@dp.channel_post(F.text == "/id")
+async def channel_id_helper(message: Message):
+    """داخل کانال بنویسید /id تا ربات شناسه‌ی کانال را بگوید (برای BACKUP_CHAT_ID)."""
+    await message.answer(f"🆔 شناسه‌ی این کانال:\n{message.chat.id}\n\nاین عدد را در Render به‌عنوان BACKUP_CHAT_ID بگذارید.")
 
 
 @dp.message(F.text == "/admin")
@@ -1757,12 +2033,274 @@ async def process_test_title(message: Message, state: FSMContext):
         await message.answer("این عنوان تکراری است. لطفاً عنوان دیگری بفرستید:")
         return
 
-    await state.update_data(test_id=test_id, segment_index=1)
+    await state.update_data(test_id=test_id, segment_index=1, new_test_title=title)
+    if t_type == "mock":
+        await state.set_state(AdminStates.waiting_for_intro)
+        await message.answer(
+            f"آزمون «{title}» ثبت شد ✅\n\n"
+            "🎬 این یک «ماک کامل» است. ویس «اینتروداکشن» آزمون را بفرستید.\n"
+            "این ویس فقط قبل از سگمنت اول برای کاربر پخش می‌شود؛ متن و ترجمه نمی‌خواهد و پاسخی از کاربر گرفته نمی‌شود.\n\n"
+            "اگر اینتروداکشن ندارید بنویسید: -",
+            reply_markup=with_nav(message.chat.id),
+        )
+    else:
+        await ask_add_method(message, title)
+
+
+async def ask_add_method(message: Message, title):
+    rows = [
+        [InlineKeyboardButton(text="📦 بارگذاری با فایل ZIP (سریع‌تر)", callback_data="method_zip")],
+        [InlineKeyboardButton(text="🎙 افزودن سگمنت‌ها یکی‌یکی", callback_data="method_manual")],
+    ]
+    await message.answer(
+        f"آزمون «{title}» آماده‌ی افزودن سگمنت است.\n\nسگمنت‌ها را چطور اضافه می‌کنید؟",
+        reply_markup=with_nav(message.chat.id, rows),
+    )
+
+
+@dp.message(AdminStates.waiting_for_intro, F.voice | F.audio | F.document)
+async def process_intro_audio(message: Message, state: FSMContext):
+    data = await state.get_data()
+    if message.voice:
+        file_id = message.voice.file_id
+    elif message.audio:
+        file_id = message.audio.file_id
+    else:
+        file_id = message.document.file_id
+    with db() as conn:
+        conn.execute("UPDATE tests SET intro_file_id = ? WHERE id = ?", (file_id, data.get("test_id")))
+        conn.commit()
+    await state.set_state(None)
+    await message.answer("✅ ویس اینتروداکشن ذخیره شد.")
+    await ask_add_method(message, data.get("new_test_title", ""))
+
+
+@dp.message(AdminStates.waiting_for_intro, F.text)
+async def process_intro_skip(message: Message, state: FSMContext):
+    if message.text.strip() == "-":
+        data = await state.get_data()
+        await state.set_state(None)
+        await ask_add_method(message, data.get("new_test_title", ""))
+    else:
+        await message.answer("🎬 فایل صوتی اینتروداکشن را بفرستید، یا اگر ندارید بنویسید: -", reply_markup=with_nav(message.chat.id))
+
+
+@dp.callback_query(F.data == "method_manual")
+async def method_manual(callback: CallbackQuery, state: FSMContext):
+    if not await require_admin(callback):
+        return
+    await state.set_state(None)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="انگلیسی 🇬🇧", callback_data="lang_en"),
          InlineKeyboardButton(text="فارسی 🇮🇷", callback_data="lang_fa")]
     ])
-    await message.answer(f"آزمون «{title}» ثبت شد.\n\nزبان سگمنت شماره ۱:", reply_markup=with_nav(message.chat.id, keyboard.inline_keyboard))
+    await callback.message.answer("زبان سگمنت شماره ۱:", reply_markup=with_nav(callback.message.chat.id, keyboard.inline_keyboard))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "method_zip")
+async def method_zip(callback: CallbackQuery, state: FSMContext):
+    if not await require_admin(callback):
+        return
+    await state.set_state(AdminStates.waiting_for_zip)
+    await callback.message.answer(
+        "📦 فایل ZIP آزمون را بفرستید (حداکثر ۲۰ مگابایت).\n\n"
+        "ساختار ZIP:\n"
+        "• یک پوشه با فایل‌های صوتی (مثل 01_Segment_1_English.mp3 ...)\n"
+        "• یک فایل متنی Dialogue_Script.txt بیرون از پوشه که برای هر سگمنت زبان، «Voice Text» (متن اصلی)، "
+        "«Answer Text» (ترجمه‌ی درست) و «Audio File» (اسم فایل صوتی) دارد.\n\n"
+        "ربات همه‌ی سگمنت‌ها را خودش می‌سازد.",
+        reply_markup=with_nav(callback.message.chat.id),
+    )
+    await callback.answer()
+
+
+# ---------- خواندن ZIP آزمون ----------
+AUDIO_EXTS = (".mp3", ".m4a", ".ogg", ".oga", ".opus", ".wav")
+
+
+def parse_dialogue_script(text):
+    """فایل Dialogue_Script.txt را به لیست سگمنت‌ها تبدیل می‌کند."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
+    heads = list(re.finditer(r"^\[Segment\s+(\d+)\]\s*-?\s*(.*)$", text, re.M | re.I))
+
+    def clean(x):
+        return (x or "").strip().strip('"\u201c\u201d').strip() or None
+
+    segs = []
+    for i, h in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(text)
+        block = text[h.end():end]
+        lm = re.search(r"\(([A-Za-z]+)\)\s*$", h.group(2).strip())
+        word = lm.group(1).upper() if lm else ""
+        lang = "fa" if word in ("PERSIAN", "FARSI", "FA") else ("en" if word in ("ENGLISH", "EN") else None)
+        mv = re.search(r"Voice Text:\s*(.*?)\s*Answer Text[^\n]*:", block, re.S | re.I)
+        ma = re.search(r"Answer Text[^\n]*:\s*(.*?)\s*Audio File:", block, re.S | re.I)
+        mf = re.search(r"Audio File:\s*(.+)", block, re.I)
+        segs.append({
+            "idx": int(h.group(1)), "lang": lang,
+            "source": clean(mv.group(1)) if mv else None,
+            "answer": clean(ma.group(1)) if ma else None,
+            "audio_name": mf.group(1).strip() if mf else None,
+        })
+    return segs
+
+
+def _lang_from_name(name):
+    n = (name or "").lower()
+    if "persian" in n or "farsi" in n:
+        return "fa"
+    if "english" in n:
+        return "en"
+    return None
+
+
+def read_zip_package(data):
+    """ZIP را باز می‌کند و (segments, problems, notes) برمی‌گرداند. هر segment شامل صدا، زبان، متن اصلی و ترجمه است."""
+    problems, notes = [], []
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        return [], ["فایل ZIP خراب است یا اصلاً ZIP نیست."], notes
+    with zf:
+        infos = [i for i in zf.infolist()
+                 if not i.is_dir() and "__MACOSX" not in i.filename and not os.path.basename(i.filename).startswith(".")]
+        if sum(i.file_size for i in infos) > 80 * 1024 * 1024:
+            return [], ["حجم فایل‌ها بعد از باز کردن بیش از حد بزرگ است."], notes
+
+        audio = {}
+        for i in infos:
+            if i.filename.lower().endswith(AUDIO_EXTS):
+                audio[os.path.basename(i.filename).lower()] = (os.path.basename(i.filename), i)
+        txts = [i for i in infos if i.filename.lower().endswith(".txt")]
+        txts.sort(key=lambda i: 0 if any(k in i.filename.lower() for k in ("script", "dialogue")) else 1)
+
+        def find_audio(idx, name):
+            if name and os.path.basename(name).lower() in audio:
+                return audio[os.path.basename(name).lower()]
+            for key, val in sorted(audio.items()):
+                if re.match(rf"0*{idx}[_\-\s.]", key):
+                    return val
+            return None
+
+        segs = []
+        if txts:
+            raw = zf.read(txts[0])
+            try:
+                script = raw.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                script = raw.decode("utf-8", errors="replace")
+            segs = parse_dialogue_script(script)
+            if not segs:
+                problems.append("داخل فایل متنی هیچ «[Segment N]» پیدا نشد.")
+        else:
+            notes.append("فایل متنی اسکریپت پیدا نشد؛ سگمنت‌ها از روی اسم فایل‌های صوتی ساخته شدند (بدون متن اصلی و ترجمه).")
+            for key, (nm, _info) in sorted(audio.items()):
+                m = re.match(r"(\d+)", key)
+                if m:
+                    segs.append({"idx": int(m.group(1)), "lang": _lang_from_name(nm), "source": None, "answer": None, "audio_name": nm})
+
+        seen = set()
+        for sg in segs:
+            if sg["idx"] in seen:
+                problems.append(f"شماره‌ی سگمنت {sg['idx']} تکراری است.")
+            seen.add(sg["idx"])
+            found = find_audio(sg["idx"], sg["audio_name"])
+            if not found:
+                problems.append(f"سگمنت {sg['idx']}: فایل صوتی «{sg['audio_name'] or '؟'}» داخل ZIP پیدا نشد.")
+                continue
+            nm, info = found
+            sg["audio_name"] = nm
+            sg["audio_bytes"] = zf.read(info)
+            if not sg["lang"]:
+                sg["lang"] = _lang_from_name(nm)
+            if not sg["lang"]:
+                problems.append(f"سگمنت {sg['idx']}: زبان (ENGLISH/PERSIAN) مشخص نشد.")
+            if not sg["source"] and not sg["answer"]:
+                notes.append(f"سگمنت {sg['idx']}: متن اصلی و ترجمه نداشت (کلید تصحیح ندارد).")
+        segs.sort(key=lambda x: x["idx"])
+    return segs, problems, notes
+
+
+async def upload_segment_audio(chat_id, sg):
+    """صدا را برای گرفتن file_id یک بار به چت ادمین می‌فرستد (به‌عنوان ویس؛ اگر نشد به‌عنوان آهنگ)."""
+    caption = f"📦 سگمنت {sg['idx']}"
+    name = sg["audio_name"] or f"segment_{sg['idx']}.mp3"
+    try:
+        msg = await bot.send_voice(chat_id, voice=BufferedInputFile(sg["audio_bytes"], filename=name), caption=caption, disable_notification=True)
+        obj = msg.voice
+    except Exception:
+        msg = await bot.send_audio(chat_id, audio=BufferedInputFile(sg["audio_bytes"], filename=name), caption=caption, disable_notification=True)
+        obj = msg.audio
+    return obj.file_id, (getattr(obj, "mime_type", None) or "audio/mpeg")
+
+
+@dp.message(AdminStates.waiting_for_zip, F.document)
+async def process_zip_upload(message: Message, state: FSMContext):
+    chat_id = message.chat.id
+    doc = message.document
+    if not (doc.file_name or "").lower().endswith(".zip"):
+        await message.answer("⚠️ فقط فایل با پسوند .zip قبول است (RAR یا فرمت‌های دیگر را به ZIP تبدیل کنید).", reply_markup=with_nav(chat_id))
+        return
+    if (doc.file_size or 0) > ZIP_MAX_BYTES:
+        await message.answer("⚠️ حجم فایل بیشتر از ۲۰ مگابایت است و ربات تلگرام نمی‌تواند دانلودش کند. آزمون را به دو ZIP کوچک‌تر تقسیم کنید.", reply_markup=with_nav(chat_id))
+        return
+
+    data = await state.get_data()
+    test_id = data.get("test_id")
+    title = data.get("new_test_title", "")
+    status = await message.answer("⏳ در حال دریافت و بررسی فایل ZIP...")
+    try:
+        zip_bytes = await download_bytes(doc.file_id)
+    except Exception as err:
+        await safe_edit(status, f"❌ دانلود فایل ناموفق بود:\n{str(err)[:300]}", with_nav(chat_id))
+        return
+
+    segs, problems, notes = await asyncio.to_thread(read_zip_package, zip_bytes)
+    if problems or not segs:
+        lines = problems[:15] or ["هیچ سگمنتی در ZIP پیدا نشد."]
+        await safe_edit(status, "❌ این ZIP قابل استفاده نیست:\n" + "\n".join(f"• {x}" for x in lines)
+                        + "\n\nفایل اصلاح‌شده را دوباره بفرستید.", with_nav(chat_id))
+        return
+
+    n = len(segs)
+    uploaded = []
+    for i, sg in enumerate(segs, 1):
+        await safe_edit(status, f"⏳ بارگذاری صدای سگمنت‌ها\n\n{progress_bar((i - 1) / n)} {i - 1} از {n}")
+        try:
+            file_id, mime = await upload_segment_audio(chat_id, sg)
+        except Exception as err:
+            await safe_edit(status, f"❌ بارگذاری صدای سگمنت {sg['idx']} ناموفق بود:\n{str(err)[:300]}\n\n"
+                                    "هیچ سگمنتی ذخیره نشد. دوباره ZIP را بفرستید.", with_nav(chat_id))
+            return
+        uploaded.append((sg, file_id, mime))
+        await asyncio.sleep(0.4)
+
+    with db() as conn:
+        conn.execute("DELETE FROM segments WHERE test_id = ?", (test_id,))
+        for sg, file_id, mime in uploaded:
+            conn.execute(
+                "INSERT INTO segments (test_id, file_id, segment_index, segment_lang, segment_tip, file_mime, answer_key, source_text) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (test_id, file_id, sg["idx"], sg["lang"], None, mime, sg["answer"], sg["source"]),
+            )
+        conn.commit()
+    await state.clear()
+
+    lines = [f"✅ آزمون «{title}» با {n} سگمنت ساخته شد:\n"]
+    for sg in segs:
+        d = "انگلیسی ➡️ فارسی" if sg["lang"] == "en" else "فارسی ➡️ انگلیسی"
+        keys = "📌✅" if (sg["source"] and sg["answer"]) else "⚠️ بدون کلید کامل"
+        lines.append(f"🎧 سگمنت {sg['idx']}  {d}  {keys}")
+    if notes:
+        lines.append("\nℹ️ توجه:\n" + "\n".join(f"• {x}" for x in notes[:8]))
+    lines.append("\nراهنمای سگمنت (Tip) در ZIP نبود؛ متن پیش‌فرض به کاربر نشان داده می‌شود.")
+    await safe_edit(status, "\n".join(lines), with_nav(chat_id))
+
+
+@dp.message(AdminStates.waiting_for_zip)
+async def zip_invalid(message: Message):
+    await message.answer("📦 لطفاً خود فایل ZIP را بفرستید (به‌صورت Document).", reply_markup=with_nav(message.chat.id))
 
 
 @dp.callback_query(F.data.startswith("lang_"))
@@ -2028,7 +2566,19 @@ async def main():
     logging.info("Flask web server started.")
     logging.info(f"Gemini model in use: {get_model()}")
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+
+    if BACKUP_CHAT_ID:
+        if backup_state["msg_id"] is None:
+            await backup_db_now("شروع برنامه")   # اولین پشتیبان
+        task = asyncio.create_task(backup_loop())
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        # با خاموش شدن ربات (مثلاً دیپلوی جدید) یک پشتیبان آخر می‌گیریم
+        if BACKUP_CHAT_ID and os.path.exists(DB_PATH) and os.path.getmtime(DB_PATH) != backup_state["last_mtime"]:
+            await backup_db_now("خاموش شدن ربات")
 
 
 if __name__ == "__main__":
