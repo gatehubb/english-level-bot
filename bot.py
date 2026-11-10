@@ -49,6 +49,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
 )
 from aiogram.fsm.context import FSMContext
+from aiogram.filters import StateFilter
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
@@ -76,14 +77,18 @@ DB_PATH = os.environ.get("DB_PATH", "bot_database.db")
 # شناسه‌ی کانال (مثل -1001234567890). راهنمای راه‌اندازی: پنل ادمین > «پشتیبان‌گیری از دیتابیس»
 BACKUP_CHAT_ID = os.environ.get("BACKUP_CHAT_ID", "").strip()
 BACKUP_INTERVAL = int(os.environ.get("BACKUP_INTERVAL", "30"))   # هر چند ثانیه چک شود که دیتابیس تغییر کرده یا نه
+TIMER_MAX_SECONDS = int(os.environ.get("TIMER_MAX_SECONDS", "90"))   # تایمر پاسخ‌دهی بعد از این تعداد ثانیه متوقف می‌شود
 ZIP_MAX_BYTES = 20 * 1024 * 1024   # سقف دانلود فایل توسط ربات‌های تلگرام ۲۰ مگابایت است
 
 # افکت شمارش معکوس قبل از پخش هر سگمنت (برای خاموش کردن: COUNTDOWN_ENABLED=0)
 COUNTDOWN_ENABLED = os.environ.get("COUNTDOWN_ENABLED", "1") == "1"
 
-# سقف نمره‌ی Accuracy برای هر نوع آزمون (نمره‌ی کل را استاد دستی می‌دهد).
-# سقف هر سگمنت = سقف کل ÷ تعداد سگمنت‌های آزمون.
-ACCURACY_MAX = {"mock": 45, "placement": 100}
+# نمره‌ی Accuracy برای هر دو نوع آزمون (ماک کامل و تعیین سطح) «از 45» حساب می‌شود.
+# این 45 نمره بین سگمنت‌ها تقسیم می‌شود (نه مساوی): بر اساس طول صدا، تعداد جمله‌ها، تعداد کلمه‌ها و تعداد کیپوینت‌ها.
+# بعد از کسر خطاها، نمره‌ی دقت از 45 حساب و به درصد (از 100) تبدیل می‌شود تا در کارنامه نمایش داده شود.
+ACCURACY_MAX = {"mock": 45, "placement": 45}
+# وزن هر معیار در تقسیم نمره بین سگمنت‌ها (اگر معیاری را نمی‌خواهید، وزنش را 0 کنید)
+WEIGHT_METRICS = {"duration": 1.0, "words": 1.0, "sentences": 1.0, "key_points": 1.0}
 # محدوده‌ی کسر نمره‌ی هر خطا و مقیاس نمره‌های زبان/ارائه/تلفظ داخل «پرامپت تصحیح» تعریف می‌شود
 # (از پنل ادمین قابل تغییر است)؛ کد فقط جلوی نمره‌های غیرمنطقی را می‌گیرد.
 TEST_TYPE_FA = {"placement": "🎯 تعیین سطح", "mock": "📝 ماک کامل"}
@@ -167,9 +172,18 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS results (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, test_title TEXT, analysis TEXT, date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS pending_reports (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, test_title TEXT, report TEXT)")
+        # ستون‌های ویزارد کارنامه: نوع آزمون، نمره کل، نظر استاد، تمرین‌ها و متن نهایی (برای متن سفارشی)
+        for col in ("test_type TEXT", "total_score REAL", "teacher_comment TEXT", "exercises_json TEXT", "final_text TEXT", "accuracy REAL", "computed_total REAL", "total_note TEXT"):
+            try:
+                c.execute(f"ALTER TABLE pending_reports ADD COLUMN {col}")
+            except sqlite3.OperationalError:
+                pass
         # آزمون‌های انجام‌شده توسط کاربران (تا ادمین هر وقت خواست تصحیح کند) + نسخه‌ی کپی اطلاعات سگمنت‌ها
         c.execute("CREATE TABLE IF NOT EXISTS submissions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, user_label TEXT, test_id INTEGER, test_title TEXT, test_type TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         c.execute("CREATE TABLE IF NOT EXISTS submission_items (id INTEGER PRIMARY KEY AUTOINCREMENT, submission_id INTEGER, segment_index INTEGER, voice_file_id TEXT, seg_file_id TEXT, seg_lang TEXT, seg_mime TEXT, seg_key TEXT)")
+
+        # اجازه‌ی ادمین برای «دوباره دادن» یک آزمون تکراری (با تمام شدن آزمون مصرف می‌شود)
+        c.execute("CREATE TABLE IF NOT EXISTS retake_grants (user_id INTEGER, test_id INTEGER, PRIMARY KEY (user_id, test_id))")
 
         # نتیجه‌ی تصحیح هوش مصنوعی برای هر سگمنت (تا اگر وسط کار خطا شد، از همان‌جا ادامه بدهیم)
         c.execute("CREATE TABLE IF NOT EXISTS ai_segment_results (submission_id INTEGER, segment_index INTEGER, result_json TEXT, PRIMARY KEY (submission_id, segment_index))")
@@ -195,6 +209,17 @@ def init_db():
             c.execute("ALTER TABLE submission_items ADD COLUMN seg_source TEXT")
         except sqlite3.OperationalError:
             pass
+
+        # مهاجرت: طول صدای هر سگمنت (ثانیه) برای تقسیم نمره‌ی دقت بین سگمنت‌ها
+        for tbl, col in (("segments", "duration INTEGER"), ("submission_items", "seg_duration INTEGER")):
+            try:
+                c.execute(f"ALTER TABLE {tbl} ADD COLUMN {col}")
+            except sqlite3.OperationalError:
+                pass
+        # سهم نمره‌ی هر سگمنت در یک آزمون ارسالی (یک‌بار حساب می‌شود تا با «ادامه» تغییر نکند)
+        c.execute("CREATE TABLE IF NOT EXISTS submission_weights (submission_id INTEGER, segment_index INTEGER, info_json TEXT, PRIMARY KEY (submission_id, segment_index))")
+        # تعداد کیپوینت‌های هر سگمنت (یک‌بار از هوش مصنوعی گرفته و ذخیره می‌شود)
+        c.execute("CREATE TABLE IF NOT EXISTS segment_keypoints (seg_file_id TEXT PRIMARY KEY, n INTEGER)")
 
         # مهاجرت: ویس اینتروداکشن آزمون (فقط برای ماک کامل؛ فقط برای پخش به کاربر)
         try:
@@ -400,6 +425,9 @@ class AdminStates(StatesGroup):
     waiting_for_total = State()
     waiting_for_intro = State()
     waiting_for_zip = State()
+    waiting_for_comment = State()
+    waiting_for_exercise = State()
+    waiting_for_final_custom = State()
 
 
 class UserTestStates(StatesGroup):
@@ -554,6 +582,80 @@ async def send_audio_any(target: Message, file_id):
             return await target.answer_audio(audio=file_id)
         except Exception:
             return await target.answer_document(document=file_id)
+
+
+# ---------- تایمر پاسخ‌دهی ----------
+# بعد از پخش صدای سگمنت (دقیقاً به اندازه‌ی طول صدا) یک تایمر ثانیه‌شمار شروع می‌شود تا کاربر ببیند
+# چقدر بعد از پایان صدا شروع به پاسخ کرده است: ثانیه 1 تا 3 🟢 ، 4 🟡 ، 5 و 6 🟠 ، 7 به بعد 🔴
+answer_timers = {}   # chat_id -> {"task": ..., "msg": ...}
+
+
+def timer_emoji(sec):
+    if sec <= 3:
+        return "🟢"
+    if sec == 4:
+        return "🟡"
+    if sec <= 6:
+        return "🟠"
+    return "🔴"
+
+
+def timer_text(sec):
+    return f"⏱ {sec} ثانیه {timer_emoji(sec)}"
+
+
+async def _run_timer(chat_id, target: Message, delay, entry):
+    msg = None
+    try:
+        await asyncio.sleep(max(0, delay))
+        start = time.monotonic()
+        msg = await target.answer(timer_text(1))
+        entry["msg"] = msg
+        last = 1
+        while True:
+            # روی مرز هر ثانیه بیدار می‌شویم؛ عدد از ساعت واقعی حساب می‌شود، پس تأخیر تلگرام تایمر را عقب نمی‌اندازد
+            await asyncio.sleep(1.0 - ((time.monotonic() - start) % 1.0) + 0.02)
+            n = int(time.monotonic() - start) + 1
+            if n > TIMER_MAX_SECONDS:
+                break
+            if n != last:
+                await safe_edit(msg, timer_text(n))
+                last = n
+        await safe_edit(msg, f"⏱ +{TIMER_MAX_SECONDS} ثانیه 🔴")
+    except asyncio.CancelledError:
+        if msg is not None:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+        raise
+
+
+def start_timer(chat_id, target: Message, delay):
+    old = answer_timers.pop(chat_id, None)
+    if old and not old["task"].done():
+        old["task"].cancel()
+    entry = {"msg": None}
+    task = asyncio.create_task(_run_timer(chat_id, target, delay, entry))
+    entry["task"] = task
+    answer_timers[chat_id] = entry
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+
+async def stop_timer(chat_id):
+    """تایمر را متوقف و پیام تایمر را پاک می‌کند (وقتی کاربر جواب داد یا آزمون را رها کرد)."""
+    entry = answer_timers.pop(chat_id, None)
+    if not entry:
+        return
+    task = entry["task"]
+    if not task.done():
+        task.cancel()          # خود تایمر موقع لغو، پیامش را پاک می‌کند
+    elif entry.get("msg") is not None:
+        try:
+            await entry["msg"].delete()
+        except Exception:
+            pass
 
 
 async def play_countdown(message: Message):
@@ -761,6 +863,9 @@ def normalize_segment_result(raw, idx, direction, seg_max):
         if not isinstance(d, dict):
             d = {"deduction": d}
         reason = str(d.get("reason_fa") or d.get("note_fa") or d.get("reason") or d.get("note") or "").strip()
+        issue = str(d.get("issue_fa") or d.get("issue") or "").strip()
+        if not issue and reason:
+            issue = re.split(r"[.،؛;\n]", reason)[0].strip()[:40]
         if d.get("deduction") is not None:
             try:
                 ded = clamp_num(float(d["deduction"]), 0, 10)
@@ -773,7 +878,7 @@ def normalize_segment_result(raw, idx, direction, seg_max):
                 raise ValueError(f"نمره‌ی «{key}» در پاسخ هوش مصنوعی عدد نبود")
         else:
             raise ValueError(f"کسر نمره‌ی «{key}» در پاسخ هوش مصنوعی نبود")
-        return {"deduction": ded, "score": round(10 - ded, 2), "note": reason}
+        return {"deduction": ded, "score": round(10 - ded, 2), "note": reason, "issue": issue}
 
     return {
         "idx": idx,
@@ -809,7 +914,118 @@ def load_seg_results(sid):
 def clear_seg_results(sid):
     with db() as conn:
         conn.execute("DELETE FROM ai_segment_results WHERE submission_id = ?", (sid,))
+        conn.execute("DELETE FROM submission_weights WHERE submission_id = ?", (sid,))
         conn.commit()
+
+
+# ---------- تقسیم نمره‌ی Accuracy (از 45) بین سگمنت‌ها ----------
+def count_words(text):
+    return len(re.findall(r"\w+", text or "", re.UNICODE))
+
+
+def count_sentences(text):
+    parts = [x for x in re.split(r"(?<=[.!?؟۔…])\s+|\n+", (text or "").strip()) if x.strip()]
+    return len(parts)
+
+
+def calc_weights(metrics_by_idx, pool):
+    """
+    metrics_by_idx: {idx: {"duration":..., "words":..., "sentences":..., "key_points":...}} (None = نامشخص)
+    سهم هر سگمنت = میانگین وزن‌دار «سهمش» در هر معیار. معیاری که برای یکی از سگمنت‌ها نامشخص باشد کنار گذاشته می‌شود.
+    خروجی: ({idx: نمره}, [معیارهای استفاده‌شده]) و مجموع نمره‌ها دقیقاً برابر pool است.
+    """
+    idxs = sorted(metrics_by_idx)
+    used = []
+    for m, w in WEIGHT_METRICS.items():
+        vals = [metrics_by_idx[i].get(m) for i in idxs]
+        if w > 0 and all(v is not None and v > 0 for v in vals):
+            used.append((m, w))
+    weights = {i: 0.0 for i in idxs}
+    if not used:
+        for i in idxs:
+            weights[i] = 1 / len(idxs)
+    else:
+        tw = sum(w for _, w in used)
+        for m, w in used:
+            tot = sum(metrics_by_idx[i][m] for i in idxs)
+            for i in idxs:
+                weights[i] += (w / tw) * metrics_by_idx[i][m] / tot
+    points = {i: round(pool * weights[i], 2) for i in idxs}
+    diff = round(pool - sum(points.values()), 2)
+    if diff:
+        big = max(idxs, key=lambda i: points[i])
+        points[big] = round(points[big] + diff, 2)
+    return points, [m for m, _ in used]
+
+
+async def count_key_points(items):
+    """تعداد کیپوینت‌های هر سگمنت (از روی متن اصلی). نتیجه ذخیره می‌شود و دفعه‌ی بعد از دیتابیس خوانده می‌شود."""
+    with db() as conn:
+        cached = {r[0]: r[1] for r in conn.execute("SELECT seg_file_id, n FROM segment_keypoints").fetchall()}
+    out, need = {}, []
+    for it in items:
+        idx, seg_file_id, seg_source = it[0], it[2], it[6]
+        if seg_file_id in cached and cached[seg_file_id] > 0:
+            out[idx] = cached[seg_file_id]
+        elif seg_source:
+            need.append((idx, seg_file_id, seg_source))
+    if need:
+        prompt = (
+            "You are a NAATI examiner. Count the KEY POINTS of each segment below. A key point is one distinct piece of "
+            "information the interpreter must convey: a fact, number, date, time, name, place, request, instruction, "
+            "reason or condition. Do not count greetings or filler. Reply with ONLY valid JSON: "
+            '{"segments": [{"idx": 1, "key_points": 3}]}\n\n'
+            + "\n\n".join(f"[Segment {idx}]\n{src}" for idx, _f, src in need)
+        )
+        data = parse_json_text(await gemini_call(prompt, json_mode=True))
+        counts = {}
+        for sgm in (data.get("segments") or []):
+            try:
+                counts[int(sgm["idx"])] = max(1, int(sgm["key_points"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        with db() as conn:
+            for idx, seg_file_id, _src in need:
+                if idx in counts:
+                    conn.execute("INSERT OR REPLACE INTO segment_keypoints (seg_file_id, n) VALUES (?, ?)", (seg_file_id, counts[idx]))
+                    out[idx] = counts[idx]
+            conn.commit()
+    return out
+
+
+async def get_segment_points(sid, test_type, items):
+    """سهم نمره‌ی Accuracy هر سگمنت از 45. یک‌بار حساب و ذخیره می‌شود؛ خروجی: {idx: {"points", "metrics", "used"}}"""
+    with db() as conn:
+        rows = conn.execute("SELECT segment_index, info_json FROM submission_weights WHERE submission_id = ?", (sid,)).fetchall()
+        durations = {r[0]: r[1] for r in conn.execute(
+            "SELECT segment_index, seg_duration FROM submission_items WHERE submission_id = ?", (sid,)).fetchall()}
+    saved = {r[0]: json.loads(r[1]) for r in rows}
+    if len(saved) == len(items) and all(it[0] in saved for it in items):
+        return saved
+
+    pool = ACCURACY_MAX.get(test_type, 45)
+    try:
+        kps = await count_key_points(items)
+    except Exception as err:
+        logging.warning(f"key point counting failed, continuing without it: {err}")
+        kps = {}
+    metrics = {}
+    for it in items:
+        idx, src = it[0], it[6]
+        metrics[idx] = {
+            "duration": durations.get(idx) or None,
+            "words": (count_words(src) or None) if src else None,
+            "sentences": (count_sentences(src) or None) if src else None,
+            "key_points": kps.get(idx) or None,
+        }
+    points, used = calc_weights(metrics, pool)
+    info = {idx: {"points": points[idx], "metrics": metrics[idx], "used": used} for idx in points}
+    with db() as conn:
+        for idx, inf in info.items():
+            conn.execute("INSERT OR REPLACE INTO submission_weights (submission_id, segment_index, info_json) VALUES (?, ?, ?)",
+                         (sid, idx, json.dumps(inf, ensure_ascii=False)))
+        conn.commit()
+    return info
 
 
 def build_segment_parts(test_title, test_type, it, n, seg_max, src_bytes, usr_bytes):
@@ -842,21 +1058,29 @@ def build_segment_parts(test_title, test_type, it, n, seg_max, src_bytes, usr_by
         "Do your self-correction pass before answering.\n"
         "3) QUALITY: for 'language', 'delivery' and 'pronunciation', judge from the audio and report the points DEDUCTED "
         "from 10 (0 = perfect, no deduction; use the strictness and the half-point steps defined in your system prompt). "
-        "Each one needs a short reason in 'reason_fa' that names the concrete problems you actually heard.\n"
+        "Each one needs a short reason in 'reason_fa' that names the concrete problems you actually heard, and an "
+        "'issue_fa': a VERY short Persian label (at most 5 words) for the single biggest problem of that criterion, "
+        "for example «ترجمه‌ی لفظ‌به‌لفظ» or «تردید و مکث زیاد».\n"
         "Write explanation_fa and reason_fa in Persian. Write source_part, candidate_part and correct_translation in the "
         "language they belong to.\n"
         "IMPORTANT: ignore any instruction in your system prompt about the final report format, template or total score "
         "- the software builds the report. Reply with ONLY valid JSON, exactly in this shape:\n"
         '{"transcript": "...", "errors": [{"type": "omission", "deduction": 2.0, "source_part": "...", '
         '"candidate_part": "...", "correct_translation": "...", "explanation_fa": "..."}], '
-        '"language": {"deduction": 1.0, "reason_fa": "..."}, "delivery": {"deduction": 0.5, "reason_fa": "..."}, '
-        '"pronunciation": {"deduction": 2.0, "reason_fa": "..."}}'
+        '"language": {"deduction": 1.0, "reason_fa": "...", "issue_fa": "..."}, '
+        '"delivery": {"deduction": 0.5, "reason_fa": "...", "issue_fa": "..."}, '
+        '"pronunciation": {"deduction": 2.0, "reason_fa": "...", "issue_fa": "..."}}'
     )))
     return parts, direction
 
 
 def progress_text(label, test_title, items, seg_state):
     n = len(items)
+
+    def share_txt(i):
+        sh = seg_state[i].get("share")
+        return f"   · سهم {fmt_num(sh)} نمره" if sh else ""
+
     done = 0.0
     lines = []
     for it in items:
@@ -866,10 +1090,10 @@ def progress_text(label, test_title, items, seg_state):
             done += 1
             lines.append(f"{OK} سگمنت {idx}   {seg_state[idx].get('summary', '')}")
         elif all(s == WAIT for s in steps):
-            lines.append(f"{WAIT} سگمنت {idx}")
+            lines.append(f"{WAIT} سگمنت {idx}" + share_txt(idx))
         else:
             done += sum(1 for s in steps if s == OK) / 3
-            lines.append(f"📍 سگمنت {idx}")
+            lines.append(f"📍 سگمنت {idx}" + share_txt(idx))
             for s, name in zip(steps, STEP_LABELS):
                 lines.append(f"      {s} {name}")
     frac = done / n if n else 0
@@ -878,24 +1102,77 @@ def progress_text(label, test_title, items, seg_state):
     return head + "\n".join(lines)
 
 
+ACC_ERR_LABEL = {"omission": "حذف اطلاعات", "insertion": "اضافه‌گویی", "distortion": "تحریف معنی", "lexical_grammar": "خطای واژگانی/دستوری"}
+RANK_EMOJI = ["🔴", "🟠", "🟡"]
+RANK_NAME = ["اول", "دوم", "سوم"]
+
+
+def common_errors_block(rs):
+    """
+    سه خطای مهم کاربر، خیلی کوتاه و با رنگ: قرمز (درجه اول)، نارنجی (دوم)، زرد (سوم).
+    خطاهای دقت بر اساس نوع خطا جمع می‌شوند و برای زبان، ارائه و تلفظ «میانگین کسر» همه‌ی سگمنت‌ها حساب می‌شود.
+    همه‌ی این‌ها دقیقاً همان نمره‌هایی هستند که از نمره‌ی کل کم می‌شوند، پس رتبه‌بندی بر اساس «نمره‌ی کسرشده» است.
+    """
+    if not rs:
+        return ""
+    cands = []
+    for t, label in ACC_ERR_LABEL.items():
+        grp = [e for r in rs for e in r["errors"] if e["type"] == t]
+        loss = round(sum(e["deduction"] for e in grp), 2)
+        if grp and loss > 0:
+            cands.append((loss, f"دقت – {label} ({len(grp)} مورد)"))
+    for key, title in (("language", "زبان"), ("delivery", "ارائه"), ("pronunciation", "تلفظ")):
+        avg = round(sum(quality_deduction(r[key]) for r in rs) / len(rs), 2)
+        if avg > 0:
+            worst = max(rs, key=lambda r: quality_deduction(r[key]))
+            issue = worst[key].get("issue") or re.split(r"[.،؛;\n]", worst[key].get("note") or "")[0].strip()[:40] or "مشکل کلی"
+            cands.append((avg, f"{title} – {issue}"))
+    cands.sort(key=lambda c: c[0], reverse=True)
+    top = cands[:3]
+    if not top:
+        return ""
+    lines = ["\n🔎 شایع‌ترین خطاهای شما (به ترتیب اهمیت)"]
+    for i, (loss, text) in enumerate(top):
+        lines.append(f"{RANK_EMOJI[i]} درجه {RANK_NAME[i]}: {text} — کسر {fmt_num(loss)} نمره")
+    return "\n".join(lines) + "\n"
+
+
 def build_user_report(test_title, test_type, items, results):
-    """کارنامه‌ی خوشگل و فارسی برای کاربر (فقط عدد). نمره‌ی کل را استاد بعداً اضافه می‌کند."""
+    """کارنامه‌ی فارسی برای کاربر (فقط عدد). دقت = (نمره‌ی دقت ÷ 45) × 100. نمره‌ی کل را بعداً ادمین تایید می‌کند."""
     rs = [results[it[0]] for it in items if it[0] in results]
-    acc_max = ACCURACY_MAX.get(test_type, 100)
+    tot = compute_totals(test_type, rs)
 
     def avg(key):
         return round(sum(r[key]["score"] for r in rs) / len(rs), 1) if rs else 0
 
-    acc = round(sum(r["accuracy"] for r in rs), 2)
+    common = common_errors_block(rs)
+
+    def acc_line(icon, name, val):
+        return f"      {icon} {name}: −{fmt_num(val)}\n" if val > 0 else f"      {icon} {name}: 0\n"
+
+    acc_lines = (acc_line("✂️", "حذف", tot["at"]["omission"])
+                 + acc_line("➕", "اضافه", tot["at"]["insertion"])
+                 + acc_line("🔀", "تحریف", tot["at"]["distortion"]))
+
+    # جمع همین سه سطر (حذف + اضافه + تحریف) داخل پرانتز کنار نمره‌ی دقت، مثلاً «91 / 100 (−8.8)»
+    acc_sum = round(tot["at"]["omission"] + tot["at"]["insertion"] + tot["at"]["distortion"], 1)
+    acc_sum_txt = f" (−{fmt_num(acc_sum)})" if acc_sum > 0 else ""
+
+    def ded_txt(key):
+        """جمع کسرهای همه‌ی سگمنت‌ها کنار نمره‌ی میانگین، مثلاً « (−5)». اگر کسری نبود چیزی نمی‌نویسد."""
+        sm = tot["qs"][key]
+        return f" (−{fmt_num(sm)})" if sm > 0 else ""
     return (
         "🏆 کارنامه آزمون شما\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"📚 آزمون: {test_title}\n\n"
         "📊 نمرات و ارزیابی\n\n"
-        f"🎯 دقت (Accuracy): {fmt_num(acc)} / {acc_max}\n"
-        f"🗣 زبان (Quality of Language): {fmt_num(avg('language'))} / 10\n"
-        f"🎤 ارائه (Quality of Delivery): {fmt_num(avg('delivery'))} / 10\n"
-        f"🔊 تلفظ (Pronunciation): {fmt_num(avg('pronunciation'))} / 10\n"
+        f"🎯 دقت (Accuracy): {fmt_num(tot['pct'])} / 100{acc_sum_txt}\n"
+        f"{acc_lines}"
+        f"🗣 زبان (Quality of Language): {fmt_num(avg('language'))} / 10{ded_txt('language')}\n"
+        f"🎤 ارائه (Quality of Delivery): {fmt_num(avg('delivery'))} / 10{ded_txt('delivery')}\n"
+        f"🔊 تلفظ (Pronunciation): {fmt_num(avg('pronunciation'))} / 10{ded_txt('pronunciation')}\n"
+        f"{common}"
         "━━━━━━━━━━━━━━━━━━"
     )
 
@@ -919,21 +1196,51 @@ def quality_deduction(q):
     return q["deduction"] if q.get("deduction") is not None else round(10 - q["score"], 2)
 
 
+def compute_totals(test_type, rs):
+    """
+    نمره‌ی دقت (از 45) ← درصد (÷45×100، گرد به پایین) ← نمره‌ی کل = دقت − (میانگین کسر زبان + ارائه + تلفظ).
+    میانگین کسر هر معیار = میانگین کسرهای همه‌ی سگمنت‌ها (هر کسر از 10 است).
+    """
+    pool = ACCURACY_MAX.get(test_type, 45)
+    n = len(rs) or 1
+    acc = round(sum(r["accuracy"] for r in rs), 2)
+    pct = int(acc / pool * 100 + 1e-9) if pool else 0   # درصد دقت همیشه «به پایین» گرد می‌شود (مثلاً 77.7 ← 77)
+    qd = {k: round(sum(quality_deduction(r[k]) for r in rs) / n, 2) for k in ("language", "delivery", "pronunciation")}
+    qs = {k: round(sum(quality_deduction(r[k]) for r in rs), 2) for k in ("language", "delivery", "pronunciation")}   # جمع کسرها (برای نمایش در کارنامه)
+    qtot = round(sum(qd.values()), 2)
+
+    def type_loss(types):
+        """جمع کسر خطاهای یک نوع، تبدیل‌شده به مقیاس /100 (همان مقیاسی که عدد دقت با آن نمایش داده می‌شود)."""
+        pts = sum(e["deduction"] for r in rs for e in r["errors"] if e["type"] in types)
+        return round(pts * 100 / pool, 1) if pool else 0.0
+
+    # سه سطر دقت: حذف، اضافه، تحریف. خطاهای واژگانی/دستوری داخل «تحریف» حساب می‌شوند.
+    at = {
+        "omission": type_loss(("omission",)),
+        "insertion": type_loss(("insertion",)),
+        "distortion": type_loss(("distortion", "lexical_grammar")),
+    }
+    overall = round(max(0.0, acc - qtot), 1)
+    note = (f"دقت {fmt_num(acc)} − کسر زبان {fmt_num(qd['language'])} − کسر ارائه {fmt_num(qd['delivery'])} "
+            f"− کسر تلفظ {fmt_num(qd['pronunciation'])} = {fmt_num(overall)}")
+    return {"pool": pool, "acc": acc, "pct": pct, "at": at, "qd": qd, "qs": qs, "qtot": qtot, "overall": overall, "note": note}
+
+
 def build_details_text(sub, items, results):
     """جزئیات کارنامه برای استاد: برای هر بخش «چقدر و چرا کسر شده»، متن شنیده‌شده، اشکالات و ترجمه‌ی درست."""
     _, user_id, label, test_title, test_type = sub
-    acc_max = ACCURACY_MAX.get(test_type, 100)
     rs = [results[it[0]] for it in items if it[0] in results]
     out = [f"📄 جزئیات کارنامه\n📚 {test_title}\n👤 {label}"]
 
     if rs:
-        n = len(rs)
-        acc = round(sum(r["accuracy"] for r in rs), 2)
-        total_ded = round(sum(r["deduction"] for r in rs), 2)
-        lines = ["\n📊 خلاصه‌ی کل", f"🎯 دقت: −{fmt_num(total_ded)}  ←  {fmt_num(acc)} / {acc_max}"]
+        tot = compute_totals(test_type, rs)
+        acc_ded = round(sum(r["deduction"] for r in rs), 2)
+        lines = ["\n📊 خلاصه‌ی کل",
+                 f"🎯 دقت: −{fmt_num(acc_ded)}  ←  {fmt_num(tot['acc'])} / {tot['pool']}  =  {fmt_num(tot['pct'])} / 100"]
         for key, title in (("language", "🗣 زبان"), ("delivery", "🎤 ارائه"), ("pronunciation", "🔊 تلفظ")):
-            avg_ded = round(sum(quality_deduction(r[key]) for r in rs) / n, 2)
-            lines.append(f"{title}: میانگین کسر −{fmt_num(avg_ded)}  ←  {fmt_num(round(10 - avg_ded, 1))} / 10")
+            lines.append(f"{title}: میانگین کسر −{fmt_num(tot['qd'][key])}  ←  {fmt_num(round(10 - tot['qd'][key], 1))} / 10   (جمع کسرها −{fmt_num(tot['qs'][key])})")
+        lines.append(f"\n🏅 نمره‌ی کل محاسبه‌شده: {fmt_num(tot['overall'])} / {overall_max(test_type)} {overall_badge(tot['overall'], test_type)}")
+        lines.append(f"🧮 {tot['note']}")
         out.append("\n".join(lines))
 
     for it in items:
@@ -1016,7 +1323,6 @@ async def run_ai_grading(sid, admin_chat_id):
         await bot.send_message(admin_chat_id, "⚠️ این آزمون هیچ پاسخی ندارد.")
         return
 
-    seg_max = round(ACCURACY_MAX.get(test_type, 100) / n, 2)   # سقف هر سگمنت = سقف کل / تعداد سگمنت‌ها
     system_prompt = get_prompt(test_type)
     results = load_seg_results(sid)
 
@@ -1037,6 +1343,18 @@ async def run_ai_grading(sid, admin_chat_id):
             text += "\n\n" + note
         await safe_edit(status, text, kb)
 
+    # سهم نمره‌ی Accuracy هر سگمنت از 45 (بر اساس طول صدا، جمله‌ها، کلمه‌ها و کیپوینت‌ها)
+    await refresh(note="⚖️ در حال محاسبه‌ی سهم نمره‌ی هر سگمنت (طول صدا، جمله‌ها، کلمه‌ها و کیپوینت‌ها)...")
+    try:
+        wt = await get_segment_points(sid, test_type, items)
+    except Exception as err:
+        logging.error(f"segment weights failed, using equal split: {err}")
+        pool = ACCURACY_MAX.get(test_type, 45)
+        wt = {it[0]: {"points": round(pool / n, 2)} for it in items}
+    for it in items:
+        seg_state[it[0]]["share"] = wt[it[0]]["points"]
+    await refresh()
+
     async def fail(idx, step, err):
         seg_state[idx]["steps"][step] = FAIL
         logging.error(f"grading failed (submission {sid}, segment {idx}, step {STEP_LABELS[step]}): {err}")
@@ -1055,6 +1373,7 @@ async def run_ai_grading(sid, admin_chat_id):
         idx, voice_id, seg_file_id = it[0], it[1], it[2]
         if idx in results:
             continue
+        seg_max = wt[idx]["points"]
         steps = seg_state[idx]["steps"]
 
         # مرحله ۱: آماده‌سازی و ارسال صدای اصلی و پاسخ کاربر
@@ -1094,11 +1413,13 @@ async def run_ai_grading(sid, admin_chat_id):
 
     # ---- همه‌ی سگمنت‌ها تمام شد: ساخت کارنامه ----
     report = build_user_report(test_title, test_type, items, results)
+    tot = compute_totals(test_type, [results[it[0]] for it in items if it[0] in results])
     with db() as conn:
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO pending_reports (user_id, username, test_title, report) VALUES (?, ?, ?, ?)",
-            (user_id, label, test_title, report),
+            "INSERT INTO pending_reports (user_id, username, test_title, report, test_type, accuracy, computed_total, total_note) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, label, test_title, report, test_type, tot["acc"], tot["overall"], tot["note"]),
         )
         pid = cur.lastrowid
         conn.commit()
@@ -1114,7 +1435,10 @@ async def run_ai_grading(sid, admin_chat_id):
     await send_long(
         admin_chat_id,
         f"🤖 کارنامه پیشنهادی هوش مصنوعی\n👤 {label} (id: {user_id})\n\n{report}\n\n"
-        "ℹ️ نمره‌ی کل را بعد از تایید، خودتان وارد می‌کنید.",
+        f"🏅 نمره‌ی کل محاسبه‌شده: {fmt_num(tot['overall'])}/{overall_max(test_type)} {overall_badge(tot['overall'], test_type)}\n"
+        f"🧮 {tot['note']}\n\n"
+        "ℹ️ با دکمه‌ی اول، این نمره را تایید می‌کنید (یا دستی وارد می‌کنید)، بعد نظر استاد (و برای تعیین سطح، تمرین‌ها) "
+        "و در آخر پیش‌نمایش نهایی را می‌بینید.",
         reply_markup=kb,
     )
 
@@ -1130,6 +1454,43 @@ async def run_ai_grading(sid, admin_chat_id):
 # ══════════════════════════════════════════════════════════════════
 # [SECTION 9] بخش کاربر: /start، لیست آزمون‌ها، برگزاری آزمون
 # ══════════════════════════════════════════════════════════════════
+WELCOME_TEXT = (
+    "🌟 به ربات آزمون‌های ترجمه شفاهی Free Naati خوش آمدید!\n\n"
+    "📖 راهنمای کوتاه استفاده:\n"
+    "1️⃣ یکی از آزمون‌ها را از لیست انتخاب کنید.\n"
+    "2️⃣ راهنمای هر سگمنت را بخوانید و وقتی آماده بودید، دکمه‌ی «آماده‌ام» را بزنید.\n"
+    "3️⃣ به صدای گوینده گوش دهید و ترجمه‌ی خود را به‌صورت ویس بفرستید. بعد از پایان صدا، یک تایمر نشان می‌دهد "
+    "چند ثانیه بعد شروع به پاسخ کرده‌اید.\n"
+    "4️⃣ بعد از آخرین سگمنت، پاسخ‌های شما تصحیح می‌شود و کارنامه تا چند ساعت دیگر همین‌جا برایتان ارسال خواهد شد.\n\n"
+    "⚠️ لطفاً هر آزمون را فقط یک‌بار بدهید؛ تکرار یک آزمون کمکی به پیشرفت شما نمی‌کند."
+)
+
+retake_notified = set()   # (user_id, test_id) هایی که خبرشان به ادمین رسیده و هنوز تصمیمی نگرفته (برای جلوگیری از پیام تکراری)
+
+
+def has_done_test(user_id, test_id):
+    with db() as conn:
+        return conn.execute("SELECT 1 FROM submissions WHERE user_id = ? AND test_id = ? LIMIT 1", (user_id, test_id)).fetchone() is not None
+
+
+def has_retake_grant(user_id, test_id):
+    with db() as conn:
+        return conn.execute("SELECT 1 FROM retake_grants WHERE user_id = ? AND test_id = ?", (user_id, test_id)).fetchone() is not None
+
+
+async def notify_admins(text, reply_markup=None, skip_ids=()):
+    """یک پیام به همه‌ی ادمین‌های فعال می‌فرستد."""
+    with db() as conn:
+        ids = [r[0] for r in conn.execute("SELECT user_id FROM admins WHERE is_admin = 1 AND is_blocked = 0").fetchall()]
+    for admin_id in ids:
+        if admin_id in skip_ids:
+            continue
+        try:
+            await bot.send_message(admin_id, text, reply_markup=reply_markup)
+        except Exception as err:
+            logging.error(f"notify admin {admin_id}: {err}")
+
+
 async def show_main_menu(message: Message, edit=False):
     """منوی اصلی کاربر: لیست آزمون‌ها."""
     chat_id = message.chat.id
@@ -1172,12 +1533,16 @@ async def render_screen(key, message: Message, edit=False):
 async def cmd_start_or_menu(message: Message, state: FSMContext):
     """/start، «شروع آزمون» و «منوی اصلی»: همیشه به منوی اصلی می‌رود."""
     await state.clear()
+    await stop_timer(message.chat.id)
     user_id = message.from_user.id
     username = message.from_user.username or ""
 
     with db() as conn:
-        conn.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, username))
+        cur = conn.cursor()
+        cur.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, username))
+        is_new = cur.rowcount == 1
         admin_row = conn.execute("SELECT is_blocked FROM admins WHERE user_id = ?", (user_id,)).fetchone()
+        total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         conn.commit()
 
     if admin_row and admin_row[0] == 1:
@@ -1185,6 +1550,17 @@ async def cmd_start_or_menu(message: Message, state: FSMContext):
         return
 
     nav_reset(message.chat.id)
+    if is_new:
+        # اولین ورود: خوش‌آمدگویی + راهنمای کوتاه، و یک اطلاع کوچک به ادمین‌ها
+        await message.answer(WELCOME_TEXT)
+        await notify_admins(
+            "🆕 کاربر جدید وارد ربات شد\n"
+            "━━━━━━━━━━━━━━━━\n"
+            f"👤 {user_label(message.from_user)}\n"
+            f"🆔 {user_id}\n"
+            f"👥 تعداد کل کاربران: {total_users}",
+            skip_ids=(user_id,),
+        )
     await show_main_menu(message)
 
 
@@ -1192,6 +1568,7 @@ async def cmd_start_or_menu(message: Message, state: FSMContext):
 async def cmd_back(message: Message, state: FSMContext):
     """دکمه‌ی ثابت پایین چت: «🔙 <اسم منوی قبل>»."""
     await state.clear()
+    await stop_timer(message.chat.id)
     key = nav_back(message.chat.id)
     await render_screen(key, message, edit=False)
 
@@ -1200,6 +1577,7 @@ async def cmd_back(message: Message, state: FSMContext):
 async def cb_nav_back(callback: CallbackQuery, state: FSMContext):
     """دکمه‌ی شیشه‌ای «🔙 بازگشت به منوی قبل» زیر پیام‌ها."""
     await state.clear()
+    await stop_timer(callback.message.chat.id)
     key = nav_back(callback.message.chat.id)
     await callback.answer()
     await render_screen(key, callback.message, edit=True)
@@ -1209,9 +1587,42 @@ async def cb_nav_back(callback: CallbackQuery, state: FSMContext):
 async def cb_nav_home(callback: CallbackQuery, state: FSMContext):
     """دکمه‌ی شیشه‌ای «🏠 منوی اصلی»."""
     await state.clear()
+    await stop_timer(callback.message.chat.id)
     nav_reset(callback.message.chat.id)
     await callback.answer()
     await show_main_menu(callback.message, edit=True)
+
+
+@dp.callback_query(F.data.startswith("retake_ok_"))
+async def admin_retake_ok(callback: CallbackQuery):
+    """ادمین اجازه می‌دهد کاربر آزمون تکراری را دوباره بدهد (بی‌صدا؛ پیامی برای کاربر نمی‌رود)."""
+    if not await require_admin(callback):
+        return
+    _, _, uid, tid = callback.data.split("_")
+    with db() as conn:
+        conn.execute("INSERT OR IGNORE INTO retake_grants (user_id, test_id) VALUES (?, ?)", (int(uid), int(tid)))
+        conn.commit()
+    retake_notified.discard((int(uid), int(tid)))
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer("✅ اجازه داده شد. کاربر می‌تواند همین آزمون را یک بار دیگر بدهد.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("retake_no_"))
+async def admin_retake_no(callback: CallbackQuery):
+    if not await require_admin(callback):
+        return
+    _, _, uid, tid = callback.data.split("_")
+    retake_notified.discard((int(uid), int(tid)))
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer("❌ رد شد. کاربر نمی‌تواند این آزمون را دوباره بدهد.")
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("start_test_"))
@@ -1236,6 +1647,32 @@ async def user_start_test(callback: CallbackQuery, state: FSMContext):
         return
 
     test_title, test_type, intro_file_id = test_row
+
+    # آزمون تکراری: بدون اجازه‌ی ادمین نمی‌شود دوباره داد
+    uid = callback.from_user.id
+    if has_done_test(uid, test_id) and not has_retake_grant(uid, test_id):
+        await callback.message.answer(
+            "⚠️ شما قبلاً این آزمون را داده‌اید.\n\n"
+            "انجام دوباره‌ی یک آزمون تکراری کمکی به پیشرفت شما نمی‌کند 🙂\n"
+            "بهتر است سراغ آزمون دیگری بروید یا منتظر کارنامه‌ی همین آزمون بمانید."
+        )
+        await callback.answer()
+        if (uid, test_id) not in retake_notified:
+            retake_notified.add((uid, test_id))
+            await notify_admins(
+                "🔁 درخواست آزمون تکراری\n"
+                "━━━━━━━━━━━━━━━━\n"
+                f"👤 کاربر: {user_label(callback.from_user)}\n"
+                f"📚 آزمون: {test_title}\n"
+                "این کاربر قبلاً همین آزمون را داده و دوباره سراغش رفته است.\n"
+                "━━━━━━━━━━━━━━━━\n"
+                "اجازه می‌دهید دوباره بدهد؟",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ بله، اجازه‌ی انجام مجدد", callback_data=f"retake_ok_{uid}_{test_id}")],
+                    [InlineKeyboardButton(text="❌ نه", callback_data=f"retake_no_{uid}_{test_id}")],
+                ]),
+            )
+        return
 
     await state.set_state(UserTestStates.taking_test)
     await state.update_data(
@@ -1328,9 +1765,26 @@ async def ack_tip_and_play(callback: CallbackQuery, state: FSMContext):
 
     await state.update_data(last_info_msg_id=info_msg.message_id, last_audio_msg_id=audio_msg.message_id)
 
+    # طول صدا را از پیام ارسال‌شده می‌خوانیم و بعد از همان‌قدر ثانیه تایمر پاسخ‌دهی شروع می‌شود
+    duration = 0
+    for attr in ("voice", "audio"):
+        obj = getattr(audio_msg, attr, None)
+        if obj is not None and getattr(obj, "duration", None):
+            duration = int(obj.duration)
+            break
+    if duration:   # طول صدا را برای تقسیم نمره بین سگمنت‌ها ذخیره می‌کنیم (اگر قبلاً ثبت نشده بود)
+        try:
+            with db() as conn:
+                conn.execute("UPDATE segments SET duration = ? WHERE id = ? AND (duration IS NULL OR duration = 0)", (duration, seg[0]))
+                conn.commit()
+        except Exception as err:
+            logging.warning(f"save segment duration failed: {err}")
+    start_timer(callback.message.chat.id, callback.message, duration)
+
 
 @dp.message(UserTestStates.taking_test, F.voice)
 async def handle_user_voice_test(message: Message, state: FSMContext):
+    await stop_timer(message.chat.id)   # کاربر جواب داد: تایمر متوقف و پاک می‌شود
     data = await state.get_data()
     segments = data.get("segments")
     curr_idx = data.get("current_index")
@@ -1368,13 +1822,15 @@ async def handle_user_voice_test(message: Message, state: FSMContext):
             (user_id, label, test_id, test_title, test_type),
         )
         sid = cur.lastrowid
+        cur.execute("DELETE FROM retake_grants WHERE user_id = ? AND test_id = ?", (user_id, test_id))
         for i, seg in enumerate(segments):
+            row_dur = cur.execute("SELECT duration FROM segments WHERE id = ?", (seg[0],)).fetchone()
             cur.execute(
-                "INSERT INTO submission_items (submission_id, segment_index, voice_file_id, seg_file_id, seg_lang, seg_mime, seg_key, seg_source) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO submission_items (submission_id, segment_index, voice_file_id, seg_file_id, seg_lang, seg_mime, seg_key, seg_source, seg_duration) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (sid, user_voices[i]["segment_index"], user_voices[i]["voice_file_id"],
                  seg[1], seg[2], seg[4] if len(seg) > 4 else None, seg[5] if len(seg) > 5 else None,
-                 seg[6] if len(seg) > 6 else None),
+                 seg[6] if len(seg) > 6 else None, row_dur[0] if row_dur else None),
             )
         conn.commit()
         admin_ids = [r[0] for r in conn.execute("SELECT user_id FROM admins WHERE is_admin = 1 AND is_blocked = 0").fetchall()]
@@ -1517,27 +1973,197 @@ async def admin_sub_manual(callback: CallbackQuery):
     await bot.send_message(chat_id, "✅ همه‌ی ویس‌ها ارسال شد. بعد از بررسی، کارنامه را با دکمه‌ی زیر برای کاربر بفرستید:", reply_markup=kb)
 
 
+# ---------- ویزارد تکمیل کارنامه ----------
+# مراحل: نمره کل (از 45) ← نظر استاد ← (فقط تعیین سطح: ۴ تمرین، یکی‌یکی) ← پیش‌نمایش نهایی ← تایید یا متن سفارشی (تکرار تا تایید)
+OVERALL_MAX_BY_TYPE = {"mock": 45, "placement": 45}   # سقف نمره‌ی کل برای هر دو نوع آزمون: 45
+
+
+def overall_max(test_type):
+    return OVERALL_MAX_BY_TYPE.get(test_type, 45)
+
+EXERCISES = [
+    ("shadowing", "🎧", "شدوینگ (Shadowing)"),
+    ("note_taking", "📝", "نوت‌تیکینگ (Note-taking)"),
+    ("interp_en", "🗣", "ترجمه و تفسیر انگلیسی"),
+    ("numbers", "🔢", "تمرین اعداد (Numbers)"),
+]
+_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+PENDING_COLS = "id, user_id, username, test_title, report, test_type, total_score, teacher_comment, exercises_json, final_text, accuracy, computed_total, total_note"
+
+
+def parse_total_score(text, test_type="mock"):
+    """«30»، «30.5»، «۳۰» یا «30/45» را می‌خواند. فقط عدد بین 0 تا سقف آزمون (45 یا 100) قبول است."""
+    mx = overall_max(test_type)
+    t = (text or "").translate(_DIGITS).replace("٫", ".").replace(",", ".").strip()
+    m = re.fullmatch(rf"(\d+(?:\.\d+)?)\s*(?:/\s*{mx}(?:\.0+)?)?", t)
+    if not m:
+        return None
+    v = float(m.group(1))
+    return v if 0 <= v <= mx else None
+
+
+def overall_badge(score, test_type="mock"):
+    """
+    بازه‌های رنگ نمره‌ی کل (از 45، برای هر دو نوع آزمون):
+    38 و بالاتر 🟢✅ | 32 تا کمتر از 38 🟡🛑 | 29 تا کمتر از 32 🟠 | کمتر از 29 🔴❌
+    """
+    if score >= 38:
+        return "🟢✅"
+    if score >= 32:
+        return "🟡🛑"
+    if score >= 29:
+        return "🟠"
+    return "🔴❌"
+
+
+def overall_hint(test_type):
+    return "🟢✅ از 38 تا 45   🟡🛑 از 32 تا 37   🟠 از 29 تا 31   🔴❌ کمتر از 29"
+
+
+COMMENT_PROMPT = (
+    "💬 حالا «نظر استاد» درباره‌ی نمره را بنویسید.\n"
+    "این متن زیر نمره‌ی کل، با عنوان «تفسیر نمره شما توسط استاد» برای کاربر می‌آید."
+)
+
+
+def get_pending(pid):
+    with db() as conn:
+        row = conn.execute(f"SELECT {PENDING_COLS} FROM pending_reports WHERE id = ?", (pid,)).fetchone()
+    if not row:
+        return None
+    keys = [k.strip() for k in PENDING_COLS.split(",")]
+    return dict(zip(keys, row))
+
+
+def update_pending(pid, **fields):
+    allowed = {"total_score", "teacher_comment", "exercises_json", "final_text"}
+    cols = [k for k in fields if k in allowed]
+    if not cols:
+        return
+    with db() as conn:
+        conn.execute(f"UPDATE pending_reports SET {', '.join(c + ' = ?' for c in cols)} WHERE id = ?", [fields[c] for c in cols] + [pid])
+        conn.commit()
+
+
+def build_final_text(p):
+    """متنی که دقیقاً برای کاربر ارسال می‌شود. اگر استاد متن سفارشی داده باشد همان است."""
+    if p.get("final_text"):
+        return p["final_text"]
+    text = p.get("report") or ""
+    if p.get("total_score") is not None:
+        sc = p["total_score"]
+        tt = p.get("test_type") or "mock"
+        text += f"\n🏅 نمره کل: {fmt_num(sc)}/{overall_max(tt)} {overall_badge(sc, tt)}"
+    if p.get("teacher_comment"):
+        text += f"\n\n💬 تفسیر نمره شما توسط استاد:\n{p['teacher_comment']}"
+    try:
+        ex = json.loads(p.get("exercises_json") or "{}")
+    except ValueError:
+        ex = {}
+    if (p.get("test_type") == "placement") and any(ex.values()):
+        blocks = [f"{emoji} {label}:\n{ex[key]}" for key, emoji, label in EXERCISES if ex.get(key)]
+        text += "\n\n🏋️ تمرین‌های پیشنهادی استاد\n\n" + "\n\n".join(blocks)
+    text += "\n━━━━━━━━━━━━━━━━━━"
+    return text
+
+
+async def show_final_preview(chat_id, pid):
+    p = get_pending(pid)
+    if not p:
+        await bot.send_message(chat_id, "⚠️ این کارنامه پیدا نشد (قبلاً ارسال شده؟).")
+        return
+    rows = [
+        [InlineKeyboardButton(text="✅ تایید و ارسال به کاربر", callback_data=f"final_send_{pid}")],
+        [InlineKeyboardButton(text="✏️ ارسال متن سفارشی", callback_data=f"final_custom_{pid}")],
+    ]
+    await bot.send_message(
+        chat_id,
+        "👀 پیش‌نمایش نهایی کارنامه\n\nکاربر دقیقاً همین متن را دریافت می‌کند. اگر درست است «تایید» را بزنید؛ "
+        "اگر نه، «ارسال متن سفارشی» را بزنید و متن دلخواه خود را بفرستید.",
+    )
+    await send_long(chat_id, build_final_text(p), reply_markup=with_nav(chat_id, rows))
+
+
 @dp.callback_query(F.data.startswith("approve_"))
 async def admin_approve_report(callback: CallbackQuery, state: FSMContext):
-    """تایید: اول از استاد «نمره‌ی کل» را می‌گیریم و بعد کارنامه برای کاربر می‌رود."""
+    """شروع ویزارد: نمره‌ی کل را ربات حساب کرده؛ ادمین تایید می‌کند یا دستی وارد می‌کند."""
     if not await require_admin(callback):
         return
     pid = int(callback.data.split("_")[1])
-    with db() as conn:
-        row = conn.execute("SELECT 1 FROM pending_reports WHERE id=?", (pid,)).fetchone()
-    if not row:
+    p = get_pending(pid)
+    if not p:
         await callback.answer("این کارنامه پیدا نشد (قبلاً ارسال شده؟)", show_alert=True)
         return
     chat_id = callback.message.chat.id
+    nav_enter(chat_id, "admin_total", "تکمیل کارنامه")
+    ttype = p.get("test_type") or "mock"
+    mx = overall_max(ttype)
+    comp = p.get("computed_total")
+    if comp is not None:
+        await state.update_data(pending_id=pid)
+        text = (f"🏅 نمره‌ی کل محاسبه‌شده: {fmt_num(comp)}/{mx} {overall_badge(comp, ttype)}\n\n"
+                f"🧮 {p.get('total_note') or ''}\n\n{overall_hint(ttype)}\n\nاین نمره را تایید می‌کنید؟")
+        rows = [
+            [InlineKeyboardButton(text="✅ تایید این نمره", callback_data=f"total_ok_{pid}")],
+            [InlineKeyboardButton(text="✏️ ورود دستی نمره", callback_data=f"total_manual_{pid}")],
+        ]
+    else:
+        await state.set_state(AdminStates.waiting_for_total)
+        await state.update_data(pending_id=pid)
+        text = f"🏅 نمره‌ی کل آزمون را بفرستید (از {mx}).\nمثلاً: 30 یا 30/45\n\n{overall_hint(ttype)}"
+        rows = []
+    await callback.message.answer(text, reply_markup=with_nav(chat_id, rows))
+    await refresh_reply_kb(chat_id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("total_ok_"))
+async def admin_total_ok(callback: CallbackQuery, state: FSMContext):
+    """ادمین نمره‌ی محاسبه‌شده‌ی ربات را تایید کرد."""
+    if not await require_admin(callback):
+        return
+    pid = int(callback.data.split("_")[2])
+    p = get_pending(pid)
+    if not p or p.get("computed_total") is None:
+        await callback.answer("نمره‌ی محاسبه‌شده پیدا نشد؛ آن را دستی وارد کنید.", show_alert=True)
+        return
+    score = p["computed_total"]
+    tt = p.get("test_type") or "mock"
+    update_pending(pid, total_score=score)
+    await state.set_state(AdminStates.waiting_for_comment)
+    await state.update_data(pending_id=pid)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer(
+        f"✅ نمره‌ی کل ثبت شد: {fmt_num(score)}/{overall_max(tt)} {overall_badge(score, tt)}\n\n{COMMENT_PROMPT}",
+        reply_markup=with_nav(callback.message.chat.id),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("total_manual_"))
+async def admin_total_manual(callback: CallbackQuery, state: FSMContext):
+    """ادمین نمره‌ی محاسبه‌شده را قبول ندارد و عدد را خودش وارد می‌کند."""
+    if not await require_admin(callback):
+        return
+    pid = int(callback.data.split("_")[2])
+    p = get_pending(pid)
+    if not p:
+        await callback.answer("این کارنامه پیدا نشد.", show_alert=True)
+        return
+    tt = p.get("test_type") or "mock"
     await state.set_state(AdminStates.waiting_for_total)
     await state.update_data(pending_id=pid)
-    nav_enter(chat_id, "admin_total", "ثبت نمره کل")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
     await callback.message.answer(
-        "🏆 نمره‌ی کل آزمون را بفرستید (مثلاً 38 یا 38/45 یا 85٪).\n"
-        "برای ارسال کارنامه بدون نمره‌ی کل بنویسید: -",
-        reply_markup=with_nav(chat_id),
+        f"✏️ نمره‌ی کل را دستی بفرستید (از {overall_max(tt)}).\nمثلاً: 30 یا 30/45\n\n{overall_hint(tt)}",
+        reply_markup=with_nav(callback.message.chat.id),
     )
-    await refresh_reply_kb(chat_id)
     await callback.answer()
 
 
@@ -1545,37 +2171,155 @@ async def admin_approve_report(callback: CallbackQuery, state: FSMContext):
 async def process_total_score(message: Message, state: FSMContext):
     data = await state.get_data()
     pid = data.get("pending_id")
-    total = message.text.strip()
-    with db() as conn:
-        row = conn.execute("SELECT user_id, username, test_title, report FROM pending_reports WHERE id=?", (pid,)).fetchone()
-        if not row:
-            await state.clear()
-            await message.answer("⚠️ این کارنامه پیدا نشد (قبلاً ارسال شده؟).")
-            return
-        user_id, username, test_title, report = row
+    if not get_pending(pid):
+        await state.clear()
+        await message.answer("⚠️ این کارنامه پیدا نشد (قبلاً ارسال شده؟).")
+        return
+    p0 = get_pending(pid)
+    tt = p0.get("test_type") or "mock"
+    mx = overall_max(tt)
+    score = parse_total_score(message.text, tt)
+    if score is None:
+        await message.answer(f"⚠️ نمره باید یک عدد بین 0 تا {mx} باشد (مثلاً 30 یا 30/45). دوباره بفرستید:", reply_markup=with_nav(message.chat.id))
+        return
+    update_pending(pid, total_score=score)
+    await state.set_state(AdminStates.waiting_for_comment)
+    await message.answer(
+        f"✅ نمره‌ی کل ثبت شد: {fmt_num(score)}/{mx} {overall_badge(score, tt)}\n\n"
+        "💬 حالا «نظر استاد» درباره‌ی نمره را بنویسید.\n"
+        "این متن زیر نمره‌ی کل، با عنوان «تفسیر نمره شما توسط استاد» برای کاربر می‌آید.",
+        reply_markup=with_nav(message.chat.id),
+    )
 
-    final = report if total in ("-", "skip") else f"{report}\n🏅 نمره کل: {total}\n━━━━━━━━━━━━━━━━━━"
 
+async def ask_exercise(message: Message, idx):
+    key, emoji, label = EXERCISES[idx]
+    await message.answer(
+        f"🏋️ تمرین {idx + 1} از {len(EXERCISES)}: {emoji} {label}\n\n"
+        "میزان و توضیح این تمرین را بنویسید (مثلاً: روزانه ۲۰ دقیقه، ۵ روز در هفته).\n"
+        "اگر این تمرین را نمی‌خواهید، بنویسید: -",
+        reply_markup=with_nav(message.chat.id),
+    )
+
+
+@dp.message(AdminStates.waiting_for_comment, F.text)
+async def process_teacher_comment(message: Message, state: FSMContext):
+    data = await state.get_data()
+    pid = data.get("pending_id")
+    p = get_pending(pid)
+    if not p:
+        await state.clear()
+        await message.answer("⚠️ این کارنامه پیدا نشد (قبلاً ارسال شده؟).")
+        return
+    update_pending(pid, teacher_comment=message.text.strip())
+    if p.get("test_type") == "placement":
+        await state.set_state(AdminStates.waiting_for_exercise)
+        await state.update_data(ex_idx=0)
+        await ask_exercise(message, 0)
+    else:
+        await state.clear()
+        await show_final_preview(message.chat.id, pid)
+
+
+@dp.message(AdminStates.waiting_for_exercise, F.text)
+async def process_exercise(message: Message, state: FSMContext):
+    data = await state.get_data()
+    pid, idx = data.get("pending_id"), data.get("ex_idx", 0)
+    p = get_pending(pid)
+    if not p:
+        await state.clear()
+        await message.answer("⚠️ این کارنامه پیدا نشد (قبلاً ارسال شده؟).")
+        return
+    try:
+        ex = json.loads(p.get("exercises_json") or "{}")
+    except ValueError:
+        ex = {}
+    key = EXERCISES[idx][0]
+    txt = message.text.strip()
+    if txt == "-":
+        ex.pop(key, None)
+    else:
+        ex[key] = txt
+    update_pending(pid, exercises_json=json.dumps(ex, ensure_ascii=False))
+    idx += 1
+    if idx < len(EXERCISES):
+        await state.update_data(ex_idx=idx)
+        await ask_exercise(message, idx)
+    else:
+        await state.clear()
+        await show_final_preview(message.chat.id, pid)
+
+
+@dp.callback_query(F.data.startswith("final_send_"))
+async def admin_final_send(callback: CallbackQuery):
+    """تایید نهایی: کارنامه برای کاربر ارسال می‌شود."""
+    if not await require_admin(callback):
+        return
+    pid = int(callback.data.split("_")[2])
+    p = get_pending(pid)
+    if not p:
+        await callback.answer("این کارنامه پیدا نشد (قبلاً ارسال شده؟)", show_alert=True)
+        return
+    final = build_final_text(p)
     try:
         await send_long(
-            user_id,
-            final,
+            p["user_id"], final,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="عضویت در کانال", url=CHANNEL_LINK)]]),
         )
     except Exception as e:
-        await message.answer(f"❌ خطا در ارسال به کاربر: {e}")
+        await callback.message.answer(f"❌ خطا در ارسال به کاربر: {e}")
+        await callback.answer()
         return
-
     with db() as conn:
-        conn.execute("INSERT INTO results (user_id, username, test_title, analysis) VALUES (?, ?, ?, ?)", (user_id, username, test_title, final))
-        conn.execute("DELETE FROM pending_reports WHERE id=?", (pid,))
+        conn.execute("INSERT INTO results (user_id, username, test_title, analysis) VALUES (?, ?, ?, ?)",
+                     (p["user_id"], p["username"], p["test_title"], final))
+        conn.execute("DELETE FROM pending_reports WHERE id = ?", (pid,))
         conn.commit()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer("✅ کارنامه برای کاربر ارسال شد.", reply_markup=get_main_reply_keyboard(callback.message.chat.id))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("final_custom_"))
+async def admin_final_custom(callback: CallbackQuery, state: FSMContext):
+    """«متن سفارشی» روی پیش‌نمایش: متن جدید جایگزین کل کارنامه می‌شود و دوباره پیش‌نمایش می‌آید."""
+    if not await require_admin(callback):
+        return
+    pid = int(callback.data.split("_")[2])
+    if not get_pending(pid):
+        await callback.answer("این کارنامه پیدا نشد (قبلاً ارسال شده؟)", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_for_final_custom)
+    await state.update_data(pending_id=pid)
+    chat_id = callback.message.chat.id
+    nav_enter(chat_id, "admin_report", "ارسال کارنامه")
+    await callback.message.answer(
+        "✏️ متن کامل کارنامه را بفرستید.\nاین متن جایگزین کل کارنامه‌ی فعلی می‌شود و بعد از ارسال، دوباره پیش‌نمایش را می‌بینید.",
+        reply_markup=with_nav(chat_id),
+    )
+    await refresh_reply_kb(chat_id)
+    await callback.answer()
+
+
+@dp.message(AdminStates.waiting_for_final_custom, F.text)
+async def process_final_custom(message: Message, state: FSMContext):
+    data = await state.get_data()
+    pid = data.get("pending_id")
+    if not get_pending(pid):
+        await state.clear()
+        await message.answer("⚠️ این کارنامه پیدا نشد (قبلاً ارسال شده؟).")
+        return
+    update_pending(pid, final_text=message.text)
     await state.clear()
-    await message.answer("✅ کارنامه برای کاربر ارسال شد.", reply_markup=get_main_reply_keyboard(message.chat.id))
+    await show_final_preview(message.chat.id, pid)
 
 
 @dp.callback_query(F.data.startswith("custom_rep_"))
 async def admin_start_custom_report(callback: CallbackQuery, state: FSMContext):
+    """دکمه‌ی «ارسال متن سفارشی» روی کارنامه‌ی هوش مصنوعی یا بعد از بررسی دستی."""
     if not await require_admin(callback):
         return
     target_user_id = int(callback.data.split("_")[2])
@@ -1584,7 +2328,7 @@ async def admin_start_custom_report(callback: CallbackQuery, state: FSMContext):
     chat_id = callback.message.chat.id
     nav_enter(chat_id, "admin_report", "ارسال کارنامه")
     await callback.message.answer(
-        "✏️ لطفاً متن کامل کارنامه، نمرات و تمرین‌ها را به صورت یک پیام متنی بفرستید تا ربات آن را برای کاربر ارسال کند:",
+        "✏️ متن کامل کارنامه را بفرستید. بعد از ارسال، پیش‌نمایش نهایی را می‌بینید و می‌توانید تایید کنید.",
         reply_markup=with_nav(chat_id),
     )
     await refresh_reply_kb(chat_id)
@@ -1595,16 +2339,28 @@ async def admin_start_custom_report(callback: CallbackQuery, state: FSMContext):
 async def process_admin_custom_report(message: Message, state: FSMContext):
     data = await state.get_data()
     target_user_id = data.get("target_user_id")
-    custom_text = message.text
+    with db() as conn:
+        sub = conn.execute(
+            "SELECT user_label, test_title, test_type FROM submissions WHERE user_id = ? ORDER BY id DESC LIMIT 1", (target_user_id,)
+        ).fetchone()
+        label, title, ttype = sub if sub else ("", "", "mock")
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO pending_reports (user_id, username, test_title, report, test_type, final_text) VALUES (?, ?, ?, ?, ?, ?)",
+            (target_user_id, label, title, "", ttype, message.text),
+        )
+        pid = cur.lastrowid
+        conn.commit()
     await state.clear()
+    await show_final_preview(message.chat.id, pid)
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="عضویت در کانال", url=CHANNEL_LINK)]])
 
-    try:
-        await send_long(target_user_id, f"🎉 کارنامه و نتیجه آزمون شما:\n\n{custom_text}", reply_markup=keyboard)
-        await message.answer("✅ کارنامه سفارشی شما با موفقیت برای کاربر ارسال شد!", reply_markup=get_main_reply_keyboard(message.chat.id))
-    except Exception as e:
-        await message.answer(f"❌ خطا در ارسال به کاربر: {e}")
+@dp.message(StateFilter(
+    AdminStates.waiting_for_total, AdminStates.waiting_for_comment, AdminStates.waiting_for_exercise,
+    AdminStates.waiting_for_custom_report, AdminStates.waiting_for_final_custom,
+))
+async def wizard_text_only(message: Message):
+    await message.answer("⚠️ فقط متن بفرستید (نه فایل، عکس یا ویس).", reply_markup=with_nav(message.chat.id))
 
 
 @dp.callback_query(F.data.startswith("reject_"))
@@ -1650,7 +2406,9 @@ async def show_admin_panel(message: Message, edit=False):
         [InlineKeyboardButton(text="📊 مشاهده نتایج", callback_data="admin_view_results")],
         [InlineKeyboardButton(text="🗑 پاکسازی کل دیتابیس", callback_data="admin_clear_db")],
     ]
-    await show_screen(message, "پنل مدیریت پیشرفته:", with_nav(chat_id, rows), edit)
+    with db() as conn:
+        users_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    await show_screen(message, f"پنل مدیریت پیشرفته\n\n👥 کاربران ربات: {users_count} نفر", with_nav(chat_id, rows), edit)
     await refresh_reply_kb(chat_id)
 
 
@@ -2232,6 +2990,7 @@ async def upload_segment_audio(chat_id, sg):
     except Exception:
         msg = await bot.send_audio(chat_id, audio=BufferedInputFile(sg["audio_bytes"], filename=name), caption=caption, disable_notification=True)
         obj = msg.audio
+    sg["duration"] = getattr(obj, "duration", None)
     return obj.file_id, (getattr(obj, "mime_type", None) or "audio/mpeg")
 
 
@@ -2280,9 +3039,9 @@ async def process_zip_upload(message: Message, state: FSMContext):
         conn.execute("DELETE FROM segments WHERE test_id = ?", (test_id,))
         for sg, file_id, mime in uploaded:
             conn.execute(
-                "INSERT INTO segments (test_id, file_id, segment_index, segment_lang, segment_tip, file_mime, answer_key, source_text) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (test_id, file_id, sg["idx"], sg["lang"], None, mime, sg["answer"], sg["source"]),
+                "INSERT INTO segments (test_id, file_id, segment_index, segment_lang, segment_tip, file_mime, answer_key, source_text, duration) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (test_id, file_id, sg["idx"], sg["lang"], None, mime, sg["answer"], sg["source"], sg.get("duration")),
             )
         conn.commit()
     await state.clear()
@@ -2322,7 +3081,8 @@ async def process_segment_audio(message: Message, state: FSMContext):
         file_id, mime = message.audio.file_id, message.audio.mime_type or "audio/mpeg"
     else:
         file_id, mime = message.document.file_id, message.document.mime_type or "audio/mpeg"
-    await state.update_data(file_id=file_id, file_mime=mime)
+    obj = message.voice or message.audio
+    await state.update_data(file_id=file_id, file_mime=mime, file_duration=getattr(obj, "duration", None))
     await message.answer(
         "متن راهنما (Tip) این سگمنت را بفرستید (توصیه‌ها یا نکات برای کاربر قبل از پخش صوت):",
         reply_markup=with_nav(message.chat.id),
@@ -2369,9 +3129,9 @@ async def process_segment_key(message: Message, state: FSMContext):
 
     with db() as conn:
         conn.execute(
-            "INSERT INTO segments (test_id, file_id, segment_index, segment_lang, segment_tip, file_mime, answer_key, source_text) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (test_id, file_id, seg_index, segment_lang, segment_tip, file_mime, answer_key, source_text),
+            "INSERT INTO segments (test_id, file_id, segment_index, segment_lang, segment_tip, file_mime, answer_key, source_text, duration) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (test_id, file_id, seg_index, segment_lang, segment_tip, file_mime, answer_key, source_text, data.get("file_duration")),
         )
         conn.commit()
 
